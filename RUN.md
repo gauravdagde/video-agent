@@ -139,12 +139,15 @@ TEST_REAL_WHISPER_MODEL=~/whisper-models/ggml-base.en.bin \
   bun test src/integration/transcriptExtract.test.ts
 ```
 
-### 3a-bis. Per-scene visual descriptions (`--vision` on `--analyse`)
+### 3a-bis. Per-scene visual descriptions (auto-on with `--analyse`)
 
-`DescribeScenes` runs a vision-language model on a midpoint frame of each
-scene and adds a paragraph + tag line of structured signal (subject,
-setting, mood, composition, on-screen text, people-presence) to the
-analyse output. Two backends — picked automatically.
+`DescribeScenes` runs a vision-language model on a midpoint frame of
+selected scenes and adds a paragraph + tag line of structured signal
+(subject, setting, mood, composition, on-screen text, people presence)
+to the analyse output. **Runs automatically when a backend is
+configured** — no extra flag. Pass `--no-vision` to skip even when one is.
+
+Two backends, picked automatically:
 
 **Backend 1 (default, recommended): hosted Claude vision** — uses your
 existing `ANTHROPIC_API_KEY`. Zero new install, parallel calls (~10-15s
@@ -152,7 +155,7 @@ for 22 scenes), highest quality. Cost ~$0.10-0.20 per video on Sonnet 4.6.
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-…    # already set if you've used --execute
-bun run dev -- --analyse ~/Downloads/ad.mp4 --vision
+bun run dev -- --analyse ~/Downloads/ad.mp4
 ```
 
 **Backend 2: local llama.cpp** — fully offline, free per call after
@@ -171,12 +174,20 @@ export LLAMA_VLM_HF_REPO=ggml-org/Qwen2.5-VL-7B-Instruct-GGUF
 # Or, if you've already downloaded the GGUFs by hand:
 #   export LLAMA_VLM_MODEL=~/path/Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf
 #   export LLAMA_VLM_MMPROJ=~/path/mmproj-Qwen2.5-VL-7B-Instruct-f16.gguf
+
+bun run dev -- --analyse ~/Downloads/ad.mp4    # vision auto-runs via local llama
 ```
 
 **Force a specific backend** (when both are configured):
 
 ```bash
 export LLAMA_VLM_BACKEND=claude   # or =local
+```
+
+**Skip vision** (when configured but you don't want the cost / latency):
+
+```bash
+bun run dev -- --analyse ~/Downloads/ad.mp4 --no-vision
 ```
 
 Now the new `--vision` flag adds per-scene structured descriptions to the
@@ -335,8 +346,8 @@ The 4 skips are opt-in tests gated on:
 | `bun test`                                           | Full test suite                                                       |
 | `bun run dev`                                        | Dry-run — no API call, just print context + tool registry             |
 | `bun run dev -- --prep`                              | Generate the synthetic multi-scene demo source.mp4 + logo.png         |
-| `bun run dev -- --analyse <path>`                    | Run VideoAnalyse + SceneDetect + RichAnalysis on any video file       |
-| `bun run dev -- --analyse <path> --vision`           | Same, plus per-scene descriptions via local llama.cpp VLM (offline)   |
+| `bun run dev -- --analyse <path>`                    | Full analysis: VideoAnalyse + SceneDetect + RichAnalysis + OCR + per-scene VLM descriptions (auto-on when a backend is configured) |
+| `bun run dev -- --analyse <path> --no-vision`        | Same, but skip the VLM pass (cheap signals only, no API/model cost)   |
 | `bun run dev -- --execute`                           | Run the EditingAgent against the demo source (needs ANTHROPIC_API_KEY)|
 | `bun run dev -- --execute --source <path>`           | Same, but with YOUR video at `<path>` — copied into the demo asset    |
 

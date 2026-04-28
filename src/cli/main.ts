@@ -1,28 +1,26 @@
-// Phase 1 entrypoint. Six modes:
-//   bun run dev                                      — dry run: assemble context + tool params, print, exit
-//   bun run dev -- --prep                            — generate a synthetic source.mp4 at the demo asset path
-//   bun run dev -- --analyse <path>                  — run VideoAnalyse + SceneDetect + RichAnalysis on any video file (no API key)
-//   bun run dev -- --analyse <path> --vision         — same, plus per-scene descriptions via local llama.cpp VLM
-//   bun run dev -- --execute                         — call Claude with the editing brief on the demo source
-//   bun run dev -- --execute --source <p>            — same, but with YOUR video at <p> (copied into the demo asset path)
+// Phase 1 entrypoint. Five modes:
+//   bun run dev                                  — dry run: assemble context + tool params, print, exit
+//   bun run dev -- --prep                        — generate a synthetic source.mp4 at the demo asset path
+//   bun run dev -- --analyse <path>              — analyse a video: VideoAnalyse + SceneDetect + RichAnalysis
+//                                                  + OCR + per-scene VLM descriptions (auto-on when a backend is configured)
+//                                                  Add --no-vision to skip the VLM pass.
+//   bun run dev -- --execute                     — call Claude with the editing brief on the demo source
+//   bun run dev -- --execute --source <p>        — same, but with YOUR video at <p>
 //
 // Typical first-time flow:
 //   bun run dev -- --prep && export ANTHROPIC_API_KEY=… && bun run dev -- --execute
-// Or with your own footage:
-//   export ANTHROPIC_API_KEY=… && bun run dev -- --execute --source ~/Downloads/ad.mp4
-// Or fully offline analysis with a local vision model:
-//   brew install llama.cpp
-//   export LLAMA_VLM_MODEL=~/llama-models/qwen2.5-vl-7b/Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf
-//   export LLAMA_VLM_MMPROJ=~/llama-models/qwen2.5-vl-7b/mmproj-Qwen2.5-VL-7B-Instruct-f16.gguf
-//   bun run dev -- --analyse ~/Downloads/ad.mp4 --vision
+// Analyse your own footage (vision included automatically):
+//   export ANTHROPIC_API_KEY=… && bun run dev -- --analyse ~/Downloads/ad.mp4
 
 import { existsSync } from "node:fs";
 import { editingAgentCompactStrategy } from "../compact/CompactStrategy.ts";
 import { buildEditingAgentContext } from "../context/buildEditingAgentContext.ts";
 import { spawnEditingAgent } from "../agent/spawnEditingAgent.ts";
 import { storagePaths } from "../storage/paths.ts";
-import { DescribeScenesTool } from "../tools/analysis/DescribeScenes.ts";
-import { getLlamaVisionConfig } from "../tools/analysis/llamaVision.ts";
+import {
+  DescribeScenesTool,
+  pickBackend,
+} from "../tools/analysis/DescribeScenes.ts";
 import { runScenesOcr, type SceneOcrResult } from "../tools/analysis/ocr.ts";
 import { runRichAnalysis } from "../tools/analysis/richAnalyse.ts";
 import { SceneDetectTool } from "../tools/analysis/SceneDetect.ts";
@@ -52,9 +50,10 @@ async function main(): Promise<void> {
     return;
   }
 
-  // --analyse <path> — standalone analysis on any video file. No API key
-  // needed; just runs the local ffmpeg-backed tools (and optionally a
-  // local vision model via --vision).
+  // --analyse <path> — analyse any video. The VLM pass auto-runs when a
+  // backend is configured (ANTHROPIC_API_KEY for Claude, or
+  // LLAMA_VLM_HF_REPO / LLAMA_VLM_MODEL for local llama). Pass
+  // --no-vision to skip even when configured.
   const analyseIdx = args.indexOf("--analyse");
   if (analyseIdx >= 0) {
     const target = args[analyseIdx + 1];
@@ -62,8 +61,8 @@ async function main(): Promise<void> {
       console.error("--analyse requires a path argument");
       process.exit(1);
     }
-    const useVision = args.includes("--vision");
-    await analyse(target, useVision);
+    const noVision = args.includes("--no-vision");
+    await analyse(target, !noVision);
     return;
   }
 
@@ -217,18 +216,19 @@ async function analyse(
   const ui = createCliRenderer();
   ui.banner("Analyse", targetPath);
 
-  if (
-    useVision &&
-    process.env.ANTHROPIC_API_KEY === undefined &&
-    getLlamaVisionConfig() === null
-  ) {
-    ui.warn(
-      "--vision requested but no backend configured. Set ANTHROPIC_API_KEY " +
-        "(hosted Claude vision, recommended) or LLAMA_VLM_HF_REPO / (LLAMA_VLM_MODEL + " +
-        "LLAMA_VLM_MMPROJ) for local llama.cpp. Skipping vision pass.",
+  // Resolve whether the VLM pass should actually run. The caller asked
+  // for it (default: yes, unless --no-vision was passed), but it only
+  // happens if a backend is configured. When neither is set, surface a
+  // gentle tip and continue with the cheap signals only.
+  const backend = useVision ? pickBackend() : null;
+  if (useVision && backend === null) {
+    ui.info(
+      "Tip: per-scene VLM descriptions are off — set ANTHROPIC_API_KEY " +
+        "(hosted Claude, fastest) or LLAMA_VLM_HF_REPO (local llama.cpp) " +
+        "to enable. Use --no-vision to silence this message.",
     );
-    useVision = false;
   }
+  useVision = backend !== null;
 
   const ctx = {
     agentId: "ananalyse-0000000000000000",
@@ -306,6 +306,9 @@ async function analyse(
     composition: string;
   }> = [];
   if (useVision) {
+    ui.info(
+      `VLM backend: ${backend === "claude" ? "Claude (hosted)" : "llama-server (local)"}`,
+    );
     const sceneIndicesToDescribe = pickScenesToDescribe(
       scenes.output.scenes.length,
       ocrResults,

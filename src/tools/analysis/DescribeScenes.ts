@@ -26,7 +26,7 @@ import {
 
 export type VlmBackend = "claude" | "local";
 
-function pickBackend(): VlmBackend | null {
+export function pickBackend(): VlmBackend | null {
   const explicit = process.env.LLAMA_VLM_BACKEND;
   if (explicit === "claude" || explicit === "local") return explicit;
   if (isClaudeConfigured()) return "claude";
