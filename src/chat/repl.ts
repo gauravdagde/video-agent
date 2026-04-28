@@ -4,6 +4,7 @@ import path from "node:path";
 import readline from "node:readline/promises";
 import type { Conversation, TurnResult } from "./Conversation.ts";
 import type { CliRenderer } from "../ui/cli.ts";
+import { renderMarkdown } from "../ui/markdown.ts";
 
 // Chat-mode REPL. Reads one line at a time, dispatches slash commands or
 // forwards to Conversation.sendUserMessage. Coexists with CliRenderer's
@@ -110,14 +111,20 @@ export async function runRepl(opts: ReplOpts): Promise<void> {
       if (result.aborted) {
         out.write(`\n${ANSI.yellow}Interrupted.${ANSI.reset}\n`);
       } else if (result.finalText.length > 0) {
-        out.write("\n");
-        out.write(`${RESPONSE_BULLET} ${formatAssistantText(result.finalText)}\n`);
+        // Thin divider lifts the answer off the tool-call cluster above.
+        const divider = `${ANSI.dim}${"┄".repeat(SEPARATOR_WIDTH)}${ANSI.reset}`;
+        out.write(`\n${divider}\n`);
+        const rendered = renderMarkdown(result.finalText);
+        out.write(`${RESPONSE_BULLET} ${formatAssistantText(rendered)}\n`);
       }
       if (result.persisted !== undefined) {
         out.write(
           `  ${ANSI.dim}saved → ${result.persisted.batchFile}${ANSI.reset}\n`,
         );
       }
+      // One subtle footer per message: cumulative tokens + tool calls
+      // for THIS turn. Replaces the inline `turn N · …` lines.
+      printMessageFooter(out, result);
 
       out.write("\n");
       rl.resume();
@@ -202,6 +209,30 @@ function printBanner(out: NodeJS.WriteStream, opts: ReplOpts): void {
     `${ANSI.dim}/help for commands  ·  @path to reference files  ·  ctrl-c to interrupt  ·  /exit to quit${ANSI.reset}\n`,
   );
   out.write("\n");
+}
+
+// One-line summary printed under the assistant's reply. Replaces the
+// per-turn `turn N · X tools · Y in / Z out` lines that used to print
+// inline between tool calls — those broke the visual flow.
+function printMessageFooter(
+  out: NodeJS.WriteStream,
+  result: TurnResult,
+): void {
+  let toolCount = 0;
+  for (const n of Object.values(result.toolCallsThisMessage)) toolCount += n;
+  const inK = (result.usage.input_tokens / 1000).toFixed(1);
+  const outK = (result.usage.output_tokens / 1000).toFixed(1);
+  const cache =
+    result.usage.cache_read_input_tokens > 0
+      ? ` ${ANSI.dim}·${ANSI.reset} ${ANSI.green}${result.usage.cache_read_input_tokens} cached${ANSI.reset}`
+      : "";
+  out.write(
+    `${ANSI.dim}${result.iterations} turn${result.iterations === 1 ? "" : "s"} · ` +
+      `${toolCount} tool call${toolCount === 1 ? "" : "s"} · ` +
+      `${inK}k in / ${outK}k out${ANSI.reset}` +
+      cache +
+      "\n",
+  );
 }
 
 // Indent continuation lines two spaces so multi-line assistant text

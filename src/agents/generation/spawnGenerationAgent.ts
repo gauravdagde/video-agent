@@ -8,6 +8,7 @@ import type {
   BrandId,
   CampaignId,
 } from "../../types/video.ts";
+import { agentActivity } from "../../ui/agentActivity.ts";
 import { buildGenerationAgentContext } from "./buildGenerationAgentContext.ts";
 
 // Plan §4.4 — GenerationAgent. Reads creative brief, produces shots via
@@ -61,6 +62,8 @@ export async function spawnGenerationAgent(
     `Return the JSON storyboard summary as your final response.`;
 
   const abort = new AbortController();
+  agentActivity.register(agentId, "generation", "GenerationAgent");
+  agentActivity.setActivity(agentId, "planning storyboard");
   try {
     const run = await runAgentLoop({
       model: DEFAULT_MODEL,
@@ -75,6 +78,9 @@ export async function spawnGenerationAgent(
       },
       canUseTool,
       compactStrategy: editingAgentCompactStrategy,
+      onToolCall: (name) => {
+        agentActivity.setActivity(agentId, `running ${name}`);
+      },
     });
     task.status = "succeeded";
     task.endedAtMs = Date.now();
@@ -83,5 +89,7 @@ export async function spawnGenerationAgent(
     task.status = "failed";
     task.endedAtMs = Date.now();
     throw e;
+  } finally {
+    agentActivity.unregister(agentId);
   }
 }

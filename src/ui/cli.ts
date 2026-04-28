@@ -1,3 +1,5 @@
+import { agentActivity } from "./agentActivity.ts";
+
 // Claude-Code-style CLI renderer. ANSI escape codes only — no `ink`,
 // no `ora`, no `chalk`. Visual conventions:
 //
@@ -67,6 +69,32 @@ function colourForTool(name: string): string {
   return YELLOW; // editing tools (TrimClip, OverlayAsset, AdjustAudio)
 }
 
+// Per-tool present-participle verbs shown in the live "└ <verb>… (Ns)"
+// line while a tool is executing. Falls back to "running" for unknown
+// names. Keep these short (≤ 4 words) so the line doesn't wrap.
+const TOOL_VERBS: Record<string, string> = {
+  VideoAnalyse: "probing source video",
+  SceneDetect: "detecting scene boundaries",
+  TranscriptExtract: "transcribing audio",
+  DescribeScenes: "describing scenes",
+  RichAnalysis: "analysing colour and motion",
+  OCR: "reading on-screen text",
+  ExtractFrames: "extracting frames",
+  ToolSearch: "searching for tools",
+  EnterPlanMode: "entering plan mode",
+  ExitPlanMode: "submitting plans for approval",
+  TrimClip: "trimming clip",
+  OverlayAsset: "applying overlay",
+  AdjustAudio: "adjusting audio",
+  RenderVariant: "rendering variant",
+  DeliverToAdPlatform: "delivering to ad platform",
+  GenerateShot: "generating new shot",
+};
+
+function verbForTool(name: string): string {
+  return TOOL_VERBS[name] ?? "running";
+}
+
 export interface CliRenderer {
   banner(title: string, subtitle?: string): void;
   turnStart(turn: number): void;
@@ -126,6 +154,19 @@ export function createCliRenderer(opts: {
   let spinnerTimer: Timer | null = null;
   let spinnerActive = false;
   let liveLine: string | null = null;
+  // Set true while an external prompt (chat plan approver, slash command
+  // dialog, …) owns stdin. While paused, the timer still fires but
+  // renderLive is a no-op — readline's prompt stays intact instead of
+  // getting overwritten by `└ running… (Ns)` every 120ms.
+  let renderPaused = false;
+
+  // Snapshot of agents we've already seen, keyed by id → label. Used so
+  // we only announce NEW sub-agent forks (not the chat session's own
+  // EditingAgent which was registered before the renderer started), and
+  // so we can show the friendly label on unregister even after the
+  // entry has been removed from the registry.
+  const knownAgents = new Map<string, string>();
+  for (const e of agentActivity.list()) knownAgents.set(e.id, e.label);
 
   // The currently-running tool call. We render its `└ running… (Ns)`
   // line in place each frame, then replace it with the result summary
@@ -145,6 +186,10 @@ export function createCliRenderer(opts: {
 
   const renderLive = (): void => {
     if (!isTTY) return;
+    // Don't draw anything while an external prompt owns stdin — we'd
+    // overwrite their prompt every 120ms and they'd be stuck typing
+    // into a moving target.
+    if (renderPaused) return;
     if (liveLine === null) {
       write(CLEAR_LINE);
       return;
@@ -163,6 +208,18 @@ export function createCliRenderer(opts: {
     renderLive();
   };
 
+  const formatAgentSummary = (): string => {
+    const agents = agentActivity.list();
+    if (agents.length === 0) return "";
+    const count = agents.length;
+    const primary = agents[0]!;
+    // For 1 agent show "EditingAgent: drafting plans".
+    // For 2+ agents show "2 agents · EditingAgent: drafting plans · +1".
+    const head = `${BOLD}${primary.label}${RESET}${GREY}:${RESET} ${primary.activity}`;
+    if (count === 1) return head;
+    return `${count} agents ${GREY}·${RESET} ${head} ${GREY}· +${count - 1}${RESET}`;
+  };
+
   const formatPondering = (): string => {
     const startedAt = ponderingStartedAt ?? Date.now();
     const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
@@ -173,13 +230,16 @@ export function createCliRenderer(opts: {
         ? ""
         : ` ${GREY}·${RESET} ${GREY}↑${RESET} ${inK}k ${GREY}/${RESET} ${GREY}↓${RESET} ${outK}k tokens`;
     const sym = SPINNER[spinnerFrame % SPINNER.length];
-    return `${MAGENTA}${sym}${RESET} ${BOLD}Pondering…${RESET} ${GREY}(${elapsed}s${RESET}${tokens}${GREY} · turn ${ponderingTurn})${RESET}`;
+    const agentLine = formatAgentSummary();
+    const stage = agentLine.length > 0 ? agentLine : `${BOLD}Pondering…${RESET}`;
+    return `${MAGENTA}${sym}${RESET} ${stage} ${GREY}(${elapsed}s${RESET}${tokens}${GREY} · turn ${ponderingTurn})${RESET}`;
   };
 
   const formatToolRunning = (): string => {
     if (runningTool === null) return "";
     const elapsed = ((Date.now() - runningTool.startedAt) / 1000).toFixed(1);
-    return `  ${GREY}${CONT} running… (${elapsed}s)${RESET}`;
+    const verb = verbForTool(runningTool.name);
+    return `  ${GREY}${CONT} ${verb}… (${elapsed}s)${RESET}`;
   };
 
   // Single timer; it picks which live line to render based on which
@@ -211,6 +271,39 @@ export function createCliRenderer(opts: {
     if (isTTY) write(SHOW_CURSOR);
   };
 
+  // Subscribe to the agent registry — print a line above the live area
+  // when a sub-agent forks or finishes. The chat session's main
+  // EditingAgent is filtered out via knownAgentIds (it was registered
+  // before this subscription).
+  agentActivity.onChange(() => {
+    const current = agentActivity.list();
+    const currentIds = new Set(current.map((e) => e.id));
+    for (const e of current) {
+      if (!knownAgents.has(e.id)) {
+        knownAgents.set(e.id, e.label);
+        // Don't announce the chat session's own EditingAgent — it's the
+        // "main" agent and the banner already implies its presence.
+        // Only sub-agents (compliance, generation, generic subagent) get
+        // the inline ↳ fork line.
+        if (e.kind !== "editing") {
+          printAbove(
+            `${BLUE}↳${RESET} ${BOLD}${e.label}${RESET} ${GREY}forked (${e.id.slice(0, 12)}…)${RESET}`,
+          );
+        }
+      }
+    }
+    for (const [id, label] of [...knownAgents]) {
+      if (!currentIds.has(id)) {
+        knownAgents.delete(id);
+        if (!id.startsWith("aediting-")) {
+          printAbove(
+            `${BLUE}↳${RESET} ${BOLD}${label}${RESET} ${GREY}finished${RESET}`,
+          );
+        }
+      }
+    }
+  });
+
   return {
     banner(title, subtitle) {
       printAbove(`${BOLD}${title}${RESET}`);
@@ -235,22 +328,21 @@ export function createCliRenderer(opts: {
       // when toolSuccess/toolError fires.
       if (runningTool === null) stopTimer();
 
-      const elapsed = ponderingStartedAt
-        ? ((Date.now() - ponderingStartedAt) / 1000).toFixed(1)
-        : "";
-      const cacheNote =
-        info.cacheReadTokens > 0
-          ? ` ${GREY}·${RESET} ${GREEN}${info.cacheReadTokens} cached${RESET}`
-          : "";
-      const counts = `${info.toolCallCount} tool call${info.toolCallCount === 1 ? "" : "s"}`;
-      const turnLine =
-        `${GREY}turn ${turn} · ${counts} · ` +
-        `${info.inputTokens} in / ${info.outputTokens} out${RESET}` +
-        cacheNote +
-        (elapsed ? ` ${GREY}· ${elapsed}s${RESET}` : "");
-      printAbove(turnLine);
-
+      // In chat mode (quietPreview) we omit the per-turn header — the
+      // REPL prints a single message-level footer after the assistant's
+      // reply instead. One-shot mode still shows it.
       if (!quietPreview) {
+        const cacheNote =
+          info.cacheReadTokens > 0
+            ? ` ${GREY}·${RESET} ${GREEN}${info.cacheReadTokens} cached${RESET}`
+            : "";
+        const counts = `${info.toolCallCount} tool call${info.toolCallCount === 1 ? "" : "s"}`;
+        const turnLine =
+          `${GREY}turn ${turn} · ${counts} · ` +
+          `${info.inputTokens} in / ${info.outputTokens} out${RESET}` +
+          cacheNote;
+        printAbove(turnLine);
+
         const preview = info.textPreview.trim();
         if (preview.length > 0) {
           for (const line of preview.split("\n").slice(0, 3)) {
@@ -361,12 +453,15 @@ export function createCliRenderer(opts: {
     },
 
     detachSpinner() {
-      if (spinnerActive) {
-        if (isTTY) write(CLEAR_LINE);
-      }
+      // Pause renderLive so the spinner timer stops overwriting whatever
+      // takes ownership of the cursor next (e.g. a chat-mode approval
+      // prompt). The timer keeps ticking; we just stop drawing.
+      renderPaused = true;
+      if (isTTY) write(CLEAR_LINE);
     },
 
     attachSpinner() {
+      renderPaused = false;
       if (spinnerActive) renderLive();
     },
   };

@@ -4,6 +4,7 @@ import type { PermissionDecision } from "../permissions/canUseTool.ts";
 import type { Tool } from "../Tool.ts";
 import { newAgentId, newJobId } from "../types/ids.ts";
 import type { BrandId } from "../types/video.ts";
+import { agentActivity } from "../ui/agentActivity.ts";
 import { buildComplianceAgentContext } from "./buildComplianceAgentContext.ts";
 import type {
   ComplianceClearance,
@@ -42,42 +43,62 @@ export async function runComplianceAgent(
   opts: RunComplianceAgentOpts,
 ): Promise<ComplianceClearance> {
   const agentId = newAgentId("compliance");
-  const systemBlocks = await buildComplianceAgentContext(
-    opts.brandId,
-    opts.market,
-    opts.platform,
+  const platformLabel = opts.platform !== undefined ? ` · ${opts.platform}` : "";
+
+  // Register with the activity registry so the chat renderer's live
+  // status line shows "2 agents" while we run, and prints fork/end
+  // events above the prompt.
+  agentActivity.register(
+    agentId,
+    "compliance",
+    `ComplianceAgent${platformLabel}`,
   );
+  agentActivity.setActivity(agentId, "extracting frames");
 
-  const abort = new AbortController();
-  const run = await runAgentLoop({
-    model: DEFAULT_MODEL,
-    systemBlocks,
-    tools: complianceTools,
-    initialMessage:
-      `Inspect the asset at \`${opts.assetPath}\` for brand and platform compliance.\n` +
-      `Begin by extracting frames so you can see the actual pixels.`,
-    ctx: {
-      agentId,
-      brandId: opts.brandId,
-      campaignId: "",
-      abortSignal: abort.signal,
-    },
-    canUseTool: complianceCanUseTool,
-    compactStrategy: editingAgentCompactStrategy,
-  });
+  try {
+    const systemBlocks = await buildComplianceAgentContext(
+      opts.brandId,
+      opts.market,
+      opts.platform,
+    );
 
-  const parsed = parseClearance(run.finalText);
+    const abort = new AbortController();
+    const run = await runAgentLoop({
+      model: DEFAULT_MODEL,
+      systemBlocks,
+      tools: complianceTools,
+      initialMessage:
+        `Inspect the asset at \`${opts.assetPath}\` for brand and platform compliance.\n` +
+        `Begin by extracting frames so you can see the actual pixels.`,
+      ctx: {
+        agentId,
+        brandId: opts.brandId,
+        campaignId: "",
+        abortSignal: abort.signal,
+      },
+      canUseTool: complianceCanUseTool,
+      compactStrategy: editingAgentCompactStrategy,
+      onToolCall: (name) => {
+        agentActivity.setActivity(agentId, `running ${name}`);
+      },
+    });
 
-  return {
-    check_id: newJobId("compact"),
-    asset_path: opts.assetPath,
-    checked_at_ms: Date.now(),
-    passed: parsed.passed,
-    auto_fixable: parsed.auto_fixable,
-    human_required: parsed.human_required,
-    escalateTo: "orchestrator",
-    status: parsed.passed ? "cleared" : "failed",
-  };
+    agentActivity.setActivity(agentId, "evaluating findings");
+    const parsed = parseClearance(run.finalText);
+
+    return {
+      check_id: newJobId("compact"),
+      asset_path: opts.assetPath,
+      checked_at_ms: Date.now(),
+      passed: parsed.passed,
+      auto_fixable: parsed.auto_fixable,
+      human_required: parsed.human_required,
+      escalateTo: "orchestrator",
+      status: parsed.passed ? "cleared" : "failed",
+    };
+  } finally {
+    agentActivity.unregister(agentId);
+  }
 }
 
 interface ParsedClearance {

@@ -34,6 +34,7 @@ import type {
   RenderedVariant,
   VariantBatch,
 } from "../types/video.ts";
+import { agentActivity } from "../ui/agentActivity.ts";
 import type { CliRenderer } from "../ui/cli.ts";
 import {
   buildEnterPlanModeTool,
@@ -186,6 +187,14 @@ export class Conversation {
         DeliverToAdPlatform: preDeliverToAdPlatform,
       },
     };
+
+    // Register the chat session's main agent with the activity registry
+    // so the live status line in the renderer can show it. Activity is
+    // updated as tools fire (see buildCycleOpts). Stays registered for
+    // the lifetime of the process — there's only one Conversation in
+    // chat mode.
+    agentActivity.register(this.agentId, "editing", "EditingAgent (chat)");
+    agentActivity.setActivity(this.agentId, "awaiting input");
   }
 
   static async create(opts: ConversationOpts): Promise<Conversation> {
@@ -211,6 +220,7 @@ export class Conversation {
     this.renderedThisMessage = 0;
     const usageBefore = { ...this.state.usage };
 
+    agentActivity.setActivity(this.agentId, "thinking");
     this.state.messages.push({ role: "user", content: text });
 
     const cycleOpts = this.buildCycleOpts(abort.signal);
@@ -236,6 +246,7 @@ export class Conversation {
       }
     } finally {
       this.currentTurnAbort = null;
+      agentActivity.setActivity(this.agentId, "awaiting input");
     }
 
     let persisted: TurnResult["persisted"];
@@ -340,11 +351,22 @@ export class Conversation {
       compactStrategy: this.compactStrategy,
       modelContextLimit: this.modelContextLimit,
       reactiveOpts: this.reactiveOpts,
-      onTurnStart: (turn) => this.opts.ui?.turnStart(turn),
-      onTurnEnd: (turn, info) => this.opts.ui?.turnEnd(turn, info),
+      onTurnStart: (turn) => {
+        agentActivity.setActivity(this.agentId, "thinking");
+        this.opts.ui?.turnStart(turn);
+      },
+      onTurnEnd: (turn, info) => {
+        // Heuristic stage label after the model returns: if the agent
+        // has been invoking analysis tools, it's likely synthesising
+        // findings next; after planning tools, it's drafting plans;
+        // after render tools, it's preparing the final reply.
+        agentActivity.setActivity(this.agentId, this.deriveStage());
+        this.opts.ui?.turnEnd(turn, info);
+      },
       onToolCall: (name, input) => {
         this.toolCallsThisMessage[name] =
           (this.toolCallsThisMessage[name] ?? 0) + 1;
+        agentActivity.setActivity(this.agentId, activityForTool(name));
         this.opts.ui?.toolCall(name, input);
       },
       onToolSuccess: (name, _input, output) => {
@@ -381,6 +403,32 @@ export class Conversation {
     };
   }
 
+  // Best-guess label for what the agent is "doing" right now after a
+  // model turn completes. Looks at the most recently called tools to
+  // pick a stage. The label is informational only — used in the live
+  // renderer line to make the chat feel alive.
+  private deriveStage(): string {
+    const calls = this.toolCallsThisMessage;
+    const has = (n: string): boolean => (calls[n] ?? 0) > 0;
+    if (has("RenderVariant")) return "preparing reply";
+    if (has("ExitPlanMode") && this.planApproval.approved) {
+      return "preparing renders";
+    }
+    if (has("EnterPlanMode") && !has("ExitPlanMode")) {
+      return "drafting plans";
+    }
+    if (
+      has("VideoAnalyse") ||
+      has("SceneDetect") ||
+      has("TranscriptExtract") ||
+      has("DescribeScenes")
+    ) {
+      return "synthesising findings";
+    }
+    if (has("ToolSearch")) return "discovering tools";
+    return "thinking";
+  }
+
   private async flushToDisk(): Promise<TurnResult["persisted"]> {
     const batch: VariantBatch = {
       source_asset_id: this.opts.assetId as VariantBatch["source_asset_id"],
@@ -407,6 +455,30 @@ export class Conversation {
       variantFiles: variantPaths,
     };
   }
+}
+
+// Mirror of TOOL_VERBS in cli.ts but expressed as activity strings
+// (tool-name → "what the agent is doing right now"). Kept here so the
+// registry stays UI-agnostic — the renderer just reads activity strings,
+// and any new agent (Compliance, Generation) can use the same vocabulary.
+function activityForTool(name: string): string {
+  const map: Record<string, string> = {
+    VideoAnalyse: "probing source video",
+    SceneDetect: "detecting scene boundaries",
+    TranscriptExtract: "transcribing audio",
+    DescribeScenes: "describing scenes",
+    ExtractFrames: "extracting frames",
+    ToolSearch: "discovering tools",
+    EnterPlanMode: "entering plan mode",
+    ExitPlanMode: "submitting plans",
+    TrimClip: "trimming clip",
+    OverlayAsset: "applying overlay",
+    AdjustAudio: "adjusting audio",
+    RenderVariant: "rendering variant",
+    DeliverToAdPlatform: "delivering to platform",
+    GenerateShot: "generating shot",
+  };
+  return map[name] ?? `running ${name}`;
 }
 
 function isAbortError(e: unknown): boolean {
