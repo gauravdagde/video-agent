@@ -32,12 +32,55 @@ export interface TimeRange {
 
 const MIN_CONFIDENCE = 60;
 
+// Tesseract's WASM core prints diagnostic warnings ("Image too small to
+// scale!!", "Line cannot be recognized!!") directly to stderr/stdout.
+// These can't be silenced via the JS API because they originate in the
+// compiled C++ leptonica layer. We patch process.stderr.write +
+// process.stdout.write for the duration of the OCR run, dropping lines
+// that match the known noise patterns.
+const TESSERACT_NOISE = [
+  /Image too small to scale!!/,
+  /Line cannot be recognized!!/,
+  /Empty page!!/,
+];
+
+interface WriteFn {
+  (chunk: string | Uint8Array, ...rest: unknown[]): boolean;
+}
+
+function suppressTesseractNoise<T>(body: () => Promise<T>): Promise<T> {
+  const origStderr = process.stderr.write.bind(process.stderr) as WriteFn;
+  const origStdout = process.stdout.write.bind(process.stdout) as WriteFn;
+  const filter =
+    (orig: WriteFn): WriteFn =>
+    (chunk, ...rest) => {
+      const s =
+        typeof chunk === "string"
+          ? chunk
+          : Buffer.from(chunk).toString("utf-8");
+      if (TESSERACT_NOISE.some((re) => re.test(s))) return true;
+      return orig(chunk, ...rest);
+    };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (process.stderr as unknown as { write: WriteFn }).write = filter(origStderr);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (process.stdout as unknown as { write: WriteFn }).write = filter(origStdout);
+  return body().finally(() => {
+    (process.stderr as unknown as { write: WriteFn }).write = origStderr;
+    (process.stdout as unknown as { write: WriteFn }).write = origStdout;
+  });
+}
+
 // Single worker for the whole session — loading language data is the
 // expensive part (~1-2s). Reuse for every scene.
 async function withWorker<T>(
   fn: (worker: TesseractWorker) => Promise<T>,
 ): Promise<T> {
-  const worker = await createWorker("eng");
+  const worker = await createWorker("eng", undefined, {
+    // Silence tesseract.js's own progress logger.
+    logger: () => {},
+    errorHandler: () => {},
+  });
   try {
     return await fn(worker);
   } finally {
@@ -57,7 +100,7 @@ export async function runScenesOcr(
   await mkdir(tmpDir, { recursive: true });
 
   try {
-    return await withWorker(async (worker) => {
+    return await suppressTesseractNoise(() => withWorker(async (worker) => {
       const results: SceneOcrResult[] = [];
       for (const [i, scene] of scenes.entries()) {
         const ts = (scene.start_ms + scene.end_ms) / 2 / 1000;
@@ -116,7 +159,7 @@ export async function runScenesOcr(
         }
       }
       return results;
-    });
+    }));
   } finally {
     await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   }

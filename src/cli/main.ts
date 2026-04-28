@@ -24,6 +24,7 @@ import {
 import { runScenesOcr, type SceneOcrResult } from "../tools/analysis/ocr.ts";
 import { runRichAnalysis } from "../tools/analysis/richAnalyse.ts";
 import { SceneDetectTool } from "../tools/analysis/SceneDetect.ts";
+import { TranscriptExtractTool } from "../tools/analysis/TranscriptExtract.ts";
 import { VideoAnalyseTool } from "../tools/analysis/VideoAnalyse.ts";
 import { runFfmpeg } from "../tools/ffmpeg.ts";
 import { editingAgentTools } from "../tools/registry.ts";
@@ -285,6 +286,31 @@ async function analyse(
     ui.toolError("OCR", (e as Error).message);
   }
 
+  // Auto-transcript via TranscriptExtract — local whisper.cpp. Runs
+  // automatically when WHISPER_MODEL is set (same opt-in shape as the
+  // VLM pass). When not configured, surfaces a tip.
+  let transcriptByScene: ReadonlyMap<number, string> = new Map();
+  if (process.env.WHISPER_MODEL !== undefined && process.env.WHISPER_MODEL !== "") {
+    ui.toolCall("TranscriptExtract", { source_path: targetPath });
+    const r = await TranscriptExtractTool.call(
+      TranscriptExtractTool.validateInput({ source_path: targetPath }),
+      ctx,
+    );
+    if (!r.ok) {
+      ui.toolError("TranscriptExtract", r.error);
+    } else {
+      ui.toolSuccess("TranscriptExtract");
+      transcriptByScene = binWordsByScene(
+        r.output.words,
+        scenes.output.scenes,
+      );
+    }
+  } else {
+    ui.info(
+      "Tip: per-scene transcript is off — set WHISPER_MODEL=~/whisper-models/ggml-base.en.bin (after `brew install whisper-cpp`) to enable.",
+    );
+  }
+
   // Optional VLM pass — selective by default. Only describe scenes
   // where the cheap signals didn't already tell us enough:
   //   - first scene (the hook — semantic context always matters)
@@ -437,12 +463,39 @@ async function analyse(
       console.log(`        \x1B[90mpalette:\x1B[0m  ${palette}`);
     }
 
+    // Audio summary — mean LUFS + silence ratio. Skipped when no audio.
+    if (stats !== undefined && stats.mean_lufs !== null) {
+      const lufs = stats.mean_lufs;
+      const silencePct = Math.round(stats.silence_ratio * 100);
+      const audioParts: string[] = [`audio: ${lufs.toFixed(1)} LUFS`];
+      if (silencePct > 0) audioParts.push(`${silencePct}% silent`);
+      // Quick label: relative to global integrated loudness.
+      const globalI = rich.loudness.integrated_lufs;
+      if (globalI !== null) {
+        if (lufs >= globalI + 3) audioParts.push("(climax)");
+        else if (lufs <= globalI - 3) audioParts.push("(quiet)");
+      }
+      console.log(
+        `        \x1B[90m${audioParts.join("  ·  ")}\x1B[0m`,
+      );
+    }
+
     // OCR text if Tesseract found something.
     const ocr = ocrByIdx.get(i);
     if (ocr !== undefined && ocr.text.length > 0) {
       console.log(
         `        \x1B[90mtext (${ocr.confidence}% conf):\x1B[0m  "${ocr.text}"`,
       );
+    }
+
+    // Transcript words for this scene — what's spoken/sung over it.
+    const transcript = transcriptByScene.get(i);
+    if (transcript !== undefined && transcript.length > 0) {
+      const truncated =
+        transcript.length > 140
+          ? transcript.slice(0, 140) + "…"
+          : transcript;
+      console.log(`        \x1B[90mtranscript:\x1B[0m  "${truncated}"`);
     }
 
     // VLM description if we ran it for this scene.
@@ -516,6 +569,72 @@ function formatMs(ms: number): string {
 // dark/light/branded.
 function swatch(rgb: { r: number; g: number; b: number }): string {
   return `\x1B[48;2;${rgb.r};${rgb.g};${rgb.b}m   \x1B[0m`;
+}
+
+// Bin transcript words by scene timestamp. Each word's midpoint decides
+// which scene it belongs to. Output: scene_index → joined text.
+//
+// Drops scenes whose joined text trips the hallucination heuristic.
+// Whisper's classic failure mode on non-target-language audio (English-
+// only model on Hindi audio, music-only segments, etc.) is to chant the
+// same word repeatedly. We detect that and suppress.
+function binWordsByScene(
+  words: readonly { text: string; start_ms: number; end_ms: number }[],
+  scenes: readonly { start_ms: number; end_ms: number }[],
+): ReadonlyMap<number, string> {
+  const out = new Map<number, string[]>();
+  for (const w of words) {
+    const mid = (w.start_ms + w.end_ms) / 2;
+    for (let i = 0; i < scenes.length; i++) {
+      const s = scenes[i]!;
+      if (mid >= s.start_ms && mid < s.end_ms) {
+        if (!out.has(i)) out.set(i, []);
+        out.get(i)!.push(w.text);
+        break;
+      }
+    }
+  }
+  const joined = new Map<number, string>();
+  for (const [k, v] of out) {
+    const text = v.join(" ").replace(/\s+/g, " ").trim();
+    if (text.length === 0) continue;
+    if (isLikelyHallucination(text)) continue;
+    joined.set(k, text);
+  }
+  return joined;
+}
+
+// Detects Whisper's "stuck on one token" hallucination patterns. Two
+// signals:
+//   1. A single word accounts for >40% of all words AND repeats ≥4 times.
+//   2. Same word appears 4+ times consecutively (verbatim repetition run).
+// Either signal → drop the transcript for the scene rather than show
+// nonsense like "English English English English…"
+function isLikelyHallucination(text: string): boolean {
+  const tokens = text
+    .toLowerCase()
+    .replace(/[.,!?;:'"()]/g, "")
+    .split(/\s+/)
+    .filter((w) => w.length > 0);
+  if (tokens.length < 4) return false;
+
+  const freq = new Map<string, number>();
+  for (const t of tokens) freq.set(t, (freq.get(t) ?? 0) + 1);
+  let max = 0;
+  for (const c of freq.values()) if (c > max) max = c;
+  if (max / tokens.length > 0.4 && max >= 4) return true;
+
+  // Adjacent-repetition run.
+  let consec = 1;
+  for (let i = 1; i < tokens.length; i++) {
+    if (tokens[i] === tokens[i - 1]) {
+      consec++;
+      if (consec >= 4) return true;
+    } else {
+      consec = 1;
+    }
+  }
+  return false;
 }
 
 // --source <path> — copy a user-supplied video to the demo asset path

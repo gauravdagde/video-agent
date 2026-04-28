@@ -125,17 +125,30 @@ brew install whisper-cpp
 
 # Download a real model (the one bundled with brew is a 562KB CI stub).
 mkdir -p ~/whisper-models
-curl -L -o ~/whisper-models/ggml-base.en.bin \
-  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
 
-# Tell the system where it is
-export WHISPER_MODEL=~/whisper-models/ggml-base.en.bin
+# RECOMMENDED — multilingual base. Auto-detects language; works on
+# English, Hindi, Spanish, Mandarin, mixed-language ad creative, etc.
+# ~140MB. The default for any non-100%-English content.
+curl -L -o ~/whisper-models/ggml-base.bin \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin
+export WHISPER_MODEL=~/whisper-models/ggml-base.bin
+
+# English-ONLY alternative — slightly higher accuracy on English audio
+# but hallucinates ("English English English…") on any non-English
+# input. Only pick this if 100% of your footage is English.
+#   curl -L -o ~/whisper-models/ggml-base.en.bin \
+#     https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
+#   export WHISPER_MODEL=~/whisper-models/ggml-base.en.bin
+
+# Higher quality (~470MB) — multilingual small.
+#   curl -L -o ~/whisper-models/ggml-small.bin <hf-url-for-small>
+#   export WHISPER_MODEL=~/whisper-models/ggml-small.bin
 ```
 
 Now `TranscriptExtract` does real ASR. To verify:
 
 ```bash
-TEST_REAL_WHISPER_MODEL=~/whisper-models/ggml-base.en.bin \
+TEST_REAL_WHISPER_MODEL=~/whisper-models/ggml-base.bin \
   bun test src/integration/transcriptExtract.test.ts
 ```
 
@@ -363,7 +376,9 @@ The 4 skips are opt-in tests gated on:
 
 **ffmpeg/ffprobe not found** → `brew install ffmpeg` and verify `which ffmpeg`. The integration tests skip cleanly if missing, but `--execute` will fail when `RenderVariant` runs.
 
-**`for-tests-ggml-tiny.bin` returns empty transcripts** → that model is whisper.cpp's CI fixture, not a real model. Download `ggml-base.en.bin` per the §3a instructions.
+**`for-tests-ggml-tiny.bin` returns empty transcripts** → that model is whisper.cpp's CI fixture, not a real model. Download `ggml-base.bin` (multilingual) per the §3a instructions.
+
+**Transcript shows the same word repeated ("English English English…", "Yeah Yeah Yeah…")** → you're using an English-only model (`ggml-base.en.bin`) on non-English audio. Whisper's `.en` variants chant their nearest English-sounding token when the audio isn't English. The hallucination filter in `binWordsByScene` will silently drop these per scene, but the proper fix is to use the multilingual model: `export WHISPER_MODEL=~/whisper-models/ggml-base.bin`.
 
 **Cache miss every run** → check that `buildEditingAgentContext` is byte-deterministic. The `is byte-deterministic across builds for identical inputs` test verifies the invariant; if it fails, a loader is leaking timestamp/mtime/locale-dependent content into a stable layer.
 

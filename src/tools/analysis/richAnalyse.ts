@@ -63,6 +63,13 @@ export interface SceneStats {
   // Frame-to-frame Y (luma) deviation. Higher = more motion or rapid
   // scene change; near zero = static shot.
   readonly motion_intensity: number;
+  // Mean momentary LUFS across this scene's time range. null when the
+  // source has no audio. Compare against the global integrated_lufs to
+  // identify the climax (loudest scene) or the breath (quietest).
+  readonly mean_lufs: number | null;
+  // 0-1; share of this scene that overlaps with detected silent_segments.
+  // High = music-led or ambient (no voice); low = continuous voice/music.
+  readonly silence_ratio: number;
 }
 
 export interface RichAnalysis {
@@ -82,7 +89,13 @@ export async function runRichAnalysis(
     runFramewiseSignalStats(sourcePath, signal),
     runScenePalettes(sourcePath, scenes, signal),
   ]);
-  const sceneStats = aggregateSceneStats(framewiseStats, scenes, scenePalettes);
+  const sceneStats = aggregateSceneStats(
+    framewiseStats,
+    scenes,
+    scenePalettes,
+    audioVideoPass.momentary,
+    audioVideoPass.silent,
+  );
   return {
     loudness: audioVideoPass.loudness,
     black_segments: audioVideoPass.black,
@@ -91,10 +104,18 @@ export async function runRichAnalysis(
   };
 }
 
+interface MomentaryLoudness {
+  readonly time_ms: number;
+  readonly lufs: number;
+}
+
 interface AudioVideoPassResult {
   readonly loudness: LoudnessStats;
   readonly black: readonly TimeRange[];
   readonly silent: readonly TimeRange[];
+  // Per-second `M:` values from ebur128 — used to compute per-scene
+  // mean LUFS. Already in the stderr we're parsing, just need to capture.
+  readonly momentary: readonly MomentaryLoudness[];
 }
 
 // One ffmpeg invocation: blackdetect on video, ebur128 + silencedetect
@@ -121,12 +142,23 @@ async function runAudioVideoDetectors(
 
   const black: TimeRange[] = [];
   const silent: TimeRange[] = [];
+  const momentary: MomentaryLoudness[] = [];
   let integrated: number | null = null;
   let truePeak: number | null = null;
   let lra: number | null = null;
   let pendingSilenceStart: number | null = null;
 
   for (const line of stderr.split("\n")) {
+    // ebur128 running values: "[Parsed_ebur128_0 @ 0x…] t: 28.6  TARGET:-23 LUFS    M: -21.3 …"
+    // M = momentary loudness (400ms window). We parse t + M and keep
+    // them for per-scene aggregation later.
+    const runningMatch = line.match(/t:\s*([\d.]+).+?M:\s*(-?[\d.]+)/);
+    if (runningMatch) {
+      momentary.push({
+        time_ms: Math.round(parseFloat(runningMatch[1]!) * 1000),
+        lufs: parseFloat(runningMatch[2]!),
+      });
+    }
     // blackdetect: "[blackdetect @ 0x...] black_start:0 black_end:1.5 black_duration:1.5"
     const blackMatch = line.match(
       /black_start:([\d.]+)\s+black_end:([\d.]+)/,
@@ -170,6 +202,7 @@ async function runAudioVideoDetectors(
     },
     black,
     silent,
+    momentary,
   };
 }
 
@@ -261,6 +294,8 @@ function aggregateSceneStats(
   frames: readonly FrameStat[],
   scenes: readonly TimeRange[],
   scenePalettes: readonly (readonly PaletteEntry[])[],
+  momentary: readonly MomentaryLoudness[],
+  silentSegments: readonly TimeRange[],
 ): readonly SceneStats[] {
   return scenes.map((scene, idx) => {
     // Collect per-frame stats inside the scene's time range.
@@ -276,6 +311,11 @@ function aggregateSceneStats(
     }
     const n = ys.length;
     const palette = scenePalettes[idx] ?? [];
+
+    // Audio aggregation — runs regardless of video frame count.
+    const meanLufs = computeMeanLufs(momentary, scene);
+    const silenceRatio = computeSilenceRatio(scene, silentSegments);
+
     if (n === 0) {
       return {
         start_ms: scene.start_ms,
@@ -284,6 +324,8 @@ function aggregateSceneStats(
         mean_colour: { r: 0, g: 0, b: 0 },
         dominant_palette: palette,
         motion_intensity: 0,
+        mean_lufs: meanLufs,
+        silence_ratio: silenceRatio,
       };
     }
     const yAvg = ys.reduce((a, b) => a + b, 0) / n;
@@ -309,8 +351,48 @@ function aggregateSceneStats(
       mean_colour: colour,
       dominant_palette: palette,
       motion_intensity: Math.round(motion * 10) / 10,
+      mean_lufs: meanLufs,
+      silence_ratio: silenceRatio,
     };
   });
+}
+
+// Mean momentary LUFS across the scene's time range. ebur128 emits M
+// every ~100ms; we average all samples that fall within [start, end).
+// Skips the well-known "-inf"-ish very-low values that ebur128 emits at
+// the start of the stream before the M window has filled.
+function computeMeanLufs(
+  momentary: readonly MomentaryLoudness[],
+  scene: TimeRange,
+): number | null {
+  if (momentary.length === 0) return null;
+  let total = 0;
+  let count = 0;
+  for (const m of momentary) {
+    if (m.time_ms < scene.start_ms || m.time_ms >= scene.end_ms) continue;
+    if (m.lufs < -70) continue; // ebur128 floor / silence sentinel
+    total += m.lufs;
+    count++;
+  }
+  if (count === 0) return null;
+  return Math.round((total / count) * 10) / 10;
+}
+
+// Share of the scene's duration that overlaps with detected silent_segments.
+// 0 = no silence in the scene. 1 = entirely silent.
+function computeSilenceRatio(
+  scene: TimeRange,
+  silentSegments: readonly TimeRange[],
+): number {
+  const sceneDur = scene.end_ms - scene.start_ms;
+  if (sceneDur <= 0) return 0;
+  let overlap = 0;
+  for (const s of silentSegments) {
+    const lo = Math.max(scene.start_ms, s.start_ms);
+    const hi = Math.min(scene.end_ms, s.end_ms);
+    if (hi > lo) overlap += hi - lo;
+  }
+  return Math.round((overlap / sceneDur) * 100) / 100;
 }
 
 // Per-scene dominant palette via a single midpoint-frame extract +
