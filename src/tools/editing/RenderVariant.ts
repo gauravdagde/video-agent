@@ -43,7 +43,13 @@ export const RenderVariantTool: Tool<In, Out> = {
   async call(input: In, ctx: ToolUseContext) {
     await ensureDir(path.dirname(input.output_path));
 
+    // ffmpeg's concat demuxer resolves paths in the concat file relative
+    // to the concat file's own directory — NOT the cwd. Using
+    // path.resolve() upfront avoids the doubled-prefix surprise (e.g.
+    // /…/variants/instagram-reel/storage/brand/…) when callers pass
+    // cwd-relative clip paths.
     const concatList = input.clips
+      .map((p) => path.resolve(p))
       .map((p) => `file '${p.replace(/'/g, "'\\''")}'`)
       .join("\n");
     const concatPath = `${input.output_path}.concat.txt`;

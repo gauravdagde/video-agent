@@ -35,37 +35,36 @@ export const AdjustAudioTool: Tool<In, Out> = {
     await ensureDir(path.dirname(input.output_path));
 
     const inputs: string[] = ["-i", input.source_path];
-    let audioFilter: string | undefined;
+    // ffmpeg filter-graph syntax: [in_pad]filter1,filter2[out_pad]
+    // — commas separate FILTERS within a chain, not the input/output pads.
+    // Earlier code did `.join(",")` across all parts including pads, which
+    // produced `[0:a],loudnorm=…[aout]` and ffmpeg parsed the leading
+    // comma as a separator with an empty filter on the left.
+    const ops: string[] = [];
+    if (input.normalise_lufs !== undefined) {
+      ops.push(`loudnorm=I=${input.normalise_lufs}`);
+    }
+    if (input.duck_db !== undefined) {
+      ops.push(`volume=${input.duck_db}dB`);
+    }
+    if (ops.length === 0 && input.replace_with === undefined) {
+      return {
+        ok: false as const,
+        error:
+          "AdjustAudio called with no operation — set at least one of normalise_lufs / duck_db / replace_with",
+        retryable: false,
+      };
+    }
 
+    let audioFilter: string;
     if (input.replace_with !== undefined) {
       inputs.push("-i", input.replace_with);
-      const filters: string[] = ["[1:a]"];
-      if (input.normalise_lufs !== undefined) {
-        filters.push(`loudnorm=I=${input.normalise_lufs}`);
-      }
-      if (input.duck_db !== undefined) {
-        filters.push(`volume=${input.duck_db}dB`);
-      }
-      filters.push("[aout]");
-      audioFilter = filters.join(",").replace(",[aout]", "[aout]");
+      audioFilter =
+        ops.length > 0
+          ? `[1:a]${ops.join(",")}[aout]`
+          : `[1:a]anull[aout]`;
     } else {
-      const filters: string[] = ["[0:a]"];
-      if (input.normalise_lufs !== undefined) {
-        filters.push(`loudnorm=I=${input.normalise_lufs}`);
-      }
-      if (input.duck_db !== undefined) {
-        filters.push(`volume=${input.duck_db}dB`);
-      }
-      if (filters.length === 1) {
-        return {
-          ok: false as const,
-          error:
-            "AdjustAudio called with no operation — set at least one of normalise_lufs / duck_db / replace_with",
-          retryable: false,
-        };
-      }
-      filters.push("[aout]");
-      audioFilter = filters.join(",").replace(",[aout]", "[aout]");
+      audioFilter = `[0:a]${ops.join(",")}[aout]`;
     }
 
     const args =
@@ -73,7 +72,7 @@ export const AdjustAudioTool: Tool<In, Out> = {
         ? [
             ...inputs,
             "-filter_complex",
-            audioFilter!,
+            audioFilter,
             "-map",
             "0:v",
             "-map",
@@ -86,7 +85,7 @@ export const AdjustAudioTool: Tool<In, Out> = {
         : [
             ...inputs,
             "-filter_complex",
-            audioFilter!,
+            audioFilter,
             "-map",
             "0:v",
             "-map",

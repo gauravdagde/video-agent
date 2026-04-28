@@ -39,9 +39,14 @@ export const SceneDetectTool: Tool<In, Out> = {
   },
 
   async call(input: In, ctx: ToolUseContext) {
-    // ffmpeg's `select=gt(scene\,T)` writes scene-change times to stderr
-    // via showinfo. We parse the `pts_time:` field.
-    let stderr: string;
+    // Two-strategy detector:
+    //   1. Perceptual: ffmpeg's `select=gt(scene,T)` filter. Works well
+    //      on real-world footage.
+    //   2. Structural: ffprobe-emitted keyframe (I-frame) timestamps —
+    //      encoders place I-frames at scene cuts. Catches cases where
+    //      the perceptual metric misses (synthetic content, low-contrast
+    //      transitions). Also surfaces cuts when (1) finds nothing.
+    let perceptualCuts: number[] = [];
     try {
       const r = await runFfmpeg(
         [
@@ -55,7 +60,10 @@ export const SceneDetectTool: Tool<In, Out> = {
         ],
         ctx.abortSignal,
       );
-      stderr = r.stderr;
+      for (const line of r.stderr.split("\n")) {
+        const m = line.match(/pts_time:([\d.]+)/);
+        if (m) perceptualCuts.push(Math.round(parseFloat(m[1]!) * 1000));
+      }
     } catch (e) {
       return {
         ok: false as const,
@@ -64,15 +72,25 @@ export const SceneDetectTool: Tool<In, Out> = {
       };
     }
 
-    const cuts: number[] = [0];
-    for (const line of stderr.split("\n")) {
-      const m = line.match(/pts_time:([\d.]+)/);
-      if (m) cuts.push(Math.round(parseFloat(m[1]!) * 1000));
-    }
-
-    // Append duration as a final boundary so the last scene closes.
+    const keyframeCuts = await getKeyframeTimestampsMs(
+      input.source_path,
+      ctx.abortSignal,
+    );
     const durationMs = await getDurationMs(input.source_path, ctx.abortSignal);
-    if (durationMs > (cuts.at(-1) ?? 0)) cuts.push(durationMs);
+
+    // Merge + dedupe + drop sub-second jitter (we don't want every
+    // intra-frame keyframe in long videos — only meaningful boundaries).
+    const merged = [0, ...perceptualCuts, ...keyframeCuts]
+      .filter((t) => t >= 0 && t < durationMs)
+      .sort((a, b) => a - b);
+    const cuts: number[] = [];
+    const MIN_GAP_MS = 1500;
+    for (const t of merged) {
+      if (cuts.length === 0 || t - cuts[cuts.length - 1]! >= MIN_GAP_MS) {
+        cuts.push(t);
+      }
+    }
+    cuts.push(durationMs);
 
     const scenes: Out["scenes"] = [];
     for (let i = 0; i < cuts.length - 1; i++) {
@@ -85,6 +103,43 @@ export const SceneDetectTool: Tool<In, Out> = {
     return { ok: true as const, output: { scenes } };
   },
 };
+
+// ffprobe keyframe positions — I-frames at scene cuts are a reliable
+// structural signal even when perceptual scene-detection misses.
+async function getKeyframeTimestampsMs(
+  source: string,
+  signal: AbortSignal,
+): Promise<number[]> {
+  const { runFfprobe } = await import("../ffmpeg.ts");
+  try {
+    const { stdout } = await runFfprobe(
+      [
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-skip_frame",
+        "nokey",
+        "-show_entries",
+        "frame=pts_time",
+        "-of",
+        "csv=p=0",
+        source,
+      ],
+      signal,
+    );
+    const out: number[] = [];
+    for (const line of stdout.split("\n")) {
+      const trimmed = line.trim();
+      if (trimmed.length === 0) continue;
+      const t = parseFloat(trimmed);
+      if (Number.isFinite(t)) out.push(Math.round(t * 1000));
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
 
 async function getDurationMs(p: string, signal: AbortSignal): Promise<number> {
   const { runFfprobe } = await import("../ffmpeg.ts");

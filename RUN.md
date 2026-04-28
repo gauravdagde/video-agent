@@ -114,7 +114,7 @@ The ComplianceAgent will call `ExtractFrames` (4 inline images of the rendered v
 
 ---
 
-## Layer 3 — real ASR, real video generation, real ad delivery
+## Layer 3 — real ASR, local vision, real video generation, real ad delivery
 
 Each of these is independent — turn on only what you need.
 
@@ -138,6 +138,77 @@ Now `TranscriptExtract` does real ASR. To verify:
 TEST_REAL_WHISPER_MODEL=~/whisper-models/ggml-base.en.bin \
   bun test src/integration/transcriptExtract.test.ts
 ```
+
+### 3a-bis. Per-scene visual descriptions (`--vision` on `--analyse`)
+
+`DescribeScenes` runs a vision-language model on a midpoint frame of each
+scene and adds a paragraph + tag line of structured signal (subject,
+setting, mood, composition, on-screen text, people-presence) to the
+analyse output. Two backends — picked automatically.
+
+**Backend 1 (default, recommended): hosted Claude vision** — uses your
+existing `ANTHROPIC_API_KEY`. Zero new install, parallel calls (~10-15s
+for 22 scenes), highest quality. Cost ~$0.10-0.20 per video on Sonnet 4.6.
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-…    # already set if you've used --execute
+bun run dev -- --analyse ~/Downloads/ad.mp4 --vision
+```
+
+**Backend 2: local llama.cpp** — fully offline, free per call after
+setup. Sequential, ~30s for 22 scenes. Frames never leave the machine.
+
+```bash
+brew install llama.cpp        # installs llama-server + llama-mtmd-cli
+
+# Easiest: point at a HuggingFace repo. llama.cpp auto-downloads on first
+# use and caches at ~/Library/Caches/llama.cpp/ — including the mmproj
+# projector for vision models. ~5GB total. No huggingface-cli step.
+export LLAMA_VLM_HF_REPO=ggml-org/Qwen2.5-VL-7B-Instruct-GGUF
+# Optional — pin a specific quantisation:
+#   export LLAMA_VLM_HF_QUANT=Q4_K_M
+
+# Or, if you've already downloaded the GGUFs by hand:
+#   export LLAMA_VLM_MODEL=~/path/Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf
+#   export LLAMA_VLM_MMPROJ=~/path/mmproj-Qwen2.5-VL-7B-Instruct-f16.gguf
+```
+
+**Force a specific backend** (when both are configured):
+
+```bash
+export LLAMA_VLM_BACKEND=claude   # or =local
+```
+
+Now the new `--vision` flag adds per-scene structured descriptions to the
+analyse output:
+
+```bash
+bun run dev -- --analyse ~/Downloads/ad.mp4 --vision
+```
+
+Output gains a per-scene paragraph + tag line:
+
+```
+Scenes (22):
+   0.  00:00.00 → 00:02.84    2.84s   124/255    ▓▓▓ rgb(132,118,98)
+        Outdoor lifestyle shot — two people sitting on a wooden bench, golden-hour light.
+        subject: lifestyle  ·  setting: outdoor  ·  mood: calm  ·  composition: rule_of_thirds  ·  people
+   1.  00:02.84 → 00:05.04    2.20s    88/255    ▓▓▓ rgb(45,52,98)
+        Product close-up against deep blue backdrop, label readable.
+        subject: product close-up  ·  setting: studio  ·  mood: dramatic  ·  composition: close_up  ·  text: "EVERY DAY"
+```
+
+The same tool (`DescribeScenes`) is also available to the EditingAgent —
+it's registered as a deferred tool, so the agent can opt to call it via
+ToolSearch when planning edits. Without `LLAMA_VLM_MODEL` set, the tool
+returns a "not configured" error and the agent moves on (same pattern as
+`TranscriptExtract` without `WHISPER_MODEL`).
+
+**Performance:** sequential by design — each invocation reloads the
+model (~1-3s startup + ~50-150 tok/s). For a 22-scene video on M2/M3 Max
+expect ~30-60s total. For high-volume use, run `llama-server` instead
+and we'd swap to its HTTP API (model stays resident); same prompt shape,
+~50 LOC change.
 
 ### 3b. Real generated video (Vertex AI: Veo + Imagen)
 
@@ -257,14 +328,17 @@ The 4 skips are opt-in tests gated on:
 
 ## Common commands cheat sheet
 
-| Command                                          | What it does                                                |
-| ------------------------------------------------ | ----------------------------------------------------------- |
-| `bun install`                                    | Install deps                                                |
-| `bun run typecheck`                              | TypeScript strict mode check                                |
-| `bun test`                                       | Full test suite                                             |
-| `bun run dev`                                    | Dry-run — no API call, just print context + tool registry   |
-| `bun run dev -- --prep`                          | Generate the synthetic demo source.mp4                      |
-| `bun run dev -- --execute`                       | Run the EditingAgent end-to-end (needs ANTHROPIC_API_KEY)   |
+| Command                                              | What it does                                                          |
+| ---------------------------------------------------- | --------------------------------------------------------------------- |
+| `bun install`                                        | Install deps                                                          |
+| `bun run typecheck`                                  | TypeScript strict mode check                                          |
+| `bun test`                                           | Full test suite                                                       |
+| `bun run dev`                                        | Dry-run — no API call, just print context + tool registry             |
+| `bun run dev -- --prep`                              | Generate the synthetic multi-scene demo source.mp4 + logo.png         |
+| `bun run dev -- --analyse <path>`                    | Run VideoAnalyse + SceneDetect + RichAnalysis on any video file       |
+| `bun run dev -- --analyse <path> --vision`           | Same, plus per-scene descriptions via local llama.cpp VLM (offline)   |
+| `bun run dev -- --execute`                           | Run the EditingAgent against the demo source (needs ANTHROPIC_API_KEY)|
+| `bun run dev -- --execute --source <path>`           | Same, but with YOUR video at `<path>` — copied into the demo asset    |
 
 ---
 

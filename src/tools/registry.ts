@@ -4,6 +4,7 @@ import { OverlayAssetTool } from "./editing/OverlayAsset.ts";
 import { RenderVariantTool } from "./editing/RenderVariant.ts";
 import { TrimClipTool } from "./editing/TrimClip.ts";
 import { DeliverToAdPlatformTool } from "./delivery/DeliverToAdPlatform.ts";
+import { DescribeScenesTool } from "./analysis/DescribeScenes.ts";
 import { SceneDetectTool } from "./analysis/SceneDetect.ts";
 import { TranscriptExtractTool } from "./analysis/TranscriptExtract.ts";
 import { VideoAnalyseTool } from "./analysis/VideoAnalyse.ts";
@@ -21,4 +22,5 @@ export const editingAgentTools: readonly Tool[] = [
   VideoAnalyseTool,
   SceneDetectTool,
   TranscriptExtractTool,
+  DescribeScenesTool,
 ];

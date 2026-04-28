@@ -10,6 +10,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdir, rm, stat } from "node:fs/promises";
 import path from "node:path";
+import { AdjustAudioTool } from "../tools/editing/AdjustAudio.ts";
 import { TrimClipTool } from "../tools/editing/TrimClip.ts";
 import { RenderVariantTool } from "../tools/editing/RenderVariant.ts";
 import { VideoAnalyseTool } from "../tools/analysis/VideoAnalyse.ts";
@@ -177,5 +178,46 @@ describe.skipIf(!ffmpegAvailable)("integration: render two variants", () => {
     );
     const [w, h] = stdout.trim().split(",").map((n) => parseInt(n, 10));
     expect(w).toBeGreaterThan(h!);
+  });
+
+  // Regression: AdjustAudio with normalise_lufs only used to produce a
+  // malformed filter graph (`[0:a],loudnorm=I=-16[aout]`) that ffmpeg
+  // rejected as "No such filter: ''".
+  test("AdjustAudio with normalise_lufs only produces a valid filter graph", async () => {
+    const ctx = makeCtx();
+    const out = path.join(TMP, "audio-normalised.mp4");
+    const r = await AdjustAudioTool.call(
+      AdjustAudioTool.validateInput({
+        source_path: SOURCE,
+        output_path: out,
+        normalise_lufs: -16,
+      }),
+      ctx,
+    );
+    if (!r.ok) throw new Error(r.error);
+    expect((await stat(out)).size).toBeGreaterThan(0);
+  });
+
+  // Regression: RenderVariant's concat demuxer resolves clip paths
+  // relative to the concat file's directory. cwd-relative clips would
+  // break with a doubled-prefix error; we resolve to absolute paths up
+  // front to make this path-shape work.
+  test("RenderVariant accepts cwd-relative clip paths", async () => {
+    const ctx = makeCtx();
+    // Build a path RELATIVE TO PROCESS CWD that points at CLIP_A.
+    const cwdRelative = path.relative(process.cwd(), CLIP_A);
+    const out = path.join(TMP, "variant-cwd-relative.mp4");
+    const r = await RenderVariantTool.call(
+      RenderVariantTool.validateInput({
+        variant_spec_id: "regression-cwd-relative",
+        clips: [cwdRelative],
+        output_path: out,
+        aspect_ratio: "16:9",
+        max_duration_ms: 3_000,
+      }),
+      ctx,
+    );
+    if (!r.ok) throw new Error(r.error);
+    expect((await stat(out)).size).toBeGreaterThan(0);
   });
 });
