@@ -23,7 +23,7 @@ import { newPermissionRequestId } from "../swarm/PermissionRequest.ts";
 import { permissionSync } from "../swarm/permissionSync.ts";
 import type { Tool, ToolUseContext } from "../Tool.ts";
 import { findToolByName } from "../Tool.ts";
-import { buildToolSearchTool } from "./loopTools.ts";
+import { buildToolSearchTool, type ToolDiscovery } from "./loopTools.ts";
 
 type MessageParam = Anthropic.Messages.MessageParam;
 type TextBlockParam = Anthropic.Messages.TextBlockParam;
@@ -96,8 +96,48 @@ export interface RunResult {
   readonly toolCallsByName: Readonly<Record<string, number>>;
 }
 
-const DEFAULT_MAX_ITERATIONS = 20;
-const DEFAULT_MAX_TOKENS = 4096;
+export const DEFAULT_MAX_ITERATIONS = 20;
+export const DEFAULT_MAX_TOKENS = 4096;
+
+// State that lives across multiple `runOneTurnCycle` calls. In one-shot
+// mode (this function) it's local; in chat mode it lives on Conversation
+// and persists across user messages.
+export interface TurnState {
+  messages: MessageParam[];
+  readonly discovery: ToolDiscovery;
+  readonly usage: {
+    input_tokens: number;
+    output_tokens: number;
+    cache_creation_input_tokens: number;
+    cache_read_input_tokens: number;
+  };
+  readonly toolCallsByName: Record<string, number>;
+}
+
+// Everything the inner cycle needs that doesn't change across turns.
+export interface TurnCycleOpts {
+  readonly client: Anthropic;
+  readonly model: string;
+  readonly maxTokens: number;
+  readonly systemParams: TextBlockParam[];
+  readonly tools: readonly Tool[];
+  readonly loopTools: readonly Tool[];
+  readonly ctx: ToolUseContext;
+  readonly canUseTool: RunOpts["canUseTool"];
+  readonly hooks: HookSet | undefined;
+  readonly compactStrategy: CompactStrategy;
+  readonly modelContextLimit: number;
+  readonly reactiveOpts: ReactiveCompactOpts;
+  readonly onTurnStart?: RunOpts["onTurnStart"];
+  readonly onTurnEnd?: RunOpts["onTurnEnd"];
+  readonly onToolCall?: RunOpts["onToolCall"];
+  readonly onToolSuccess?: RunOpts["onToolSuccess"];
+  readonly onToolError?: RunOpts["onToolError"];
+}
+
+export type TurnCycleResult =
+  | { readonly done: true; readonly finalText: string }
+  | { readonly done: false };
 
 export async function runAgentLoop(opts: RunOpts): Promise<RunResult> {
   const client = opts.client ?? new Anthropic();
@@ -110,7 +150,7 @@ export async function runAgentLoop(opts: RunOpts): Promise<RunResult> {
   // as the model searches; we rebuild the tools array each turn so newly
   // discovered tools appear (and previously hidden deferred ones stay
   // hidden).
-  const discovery = { discovered: new Set<string>() };
+  const discovery: ToolDiscovery = { discovered: new Set<string>() };
   const toolSearch = buildToolSearchTool(opts.tools, discovery);
 
   // ToolSearch is always present; agent-specific loop tools (e.g.
@@ -120,112 +160,164 @@ export async function runAgentLoop(opts: RunOpts): Promise<RunResult> {
     ...(opts.extraLoopTools ?? []),
   ];
 
-  // §A — `messages` is mutated in place by autoCompact (rewriting old
-  // turns into a boundary message) and microCompact (rewriting tool_result
-  // blocks for analysis tools after EditPlan submission). Hence `let`.
-  let messages: MessageParam[] = [
-    { role: "user", content: opts.initialMessage },
-  ];
-  const reactiveOpts = opts.reactiveCompactOpts ?? reactiveCompactDefault;
-
-  const usage = {
-    input_tokens: 0,
-    output_tokens: 0,
-    cache_creation_input_tokens: 0,
-    cache_read_input_tokens: 0,
+  const state: TurnState = {
+    messages: [{ role: "user", content: opts.initialMessage }],
+    discovery,
+    usage: {
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+    },
+    toolCallsByName: {},
   };
-  const toolCallsByName: Record<string, number> = {};
+
+  const cycleOpts: TurnCycleOpts = {
+    client,
+    model: opts.model,
+    maxTokens,
+    systemParams,
+    tools: opts.tools,
+    loopTools,
+    ctx: opts.ctx,
+    canUseTool: opts.canUseTool,
+    hooks: opts.hooks,
+    compactStrategy: opts.compactStrategy,
+    modelContextLimit: opts.modelContextLimit ?? DEFAULT_MODEL_CONTEXT_LIMIT,
+    reactiveOpts: opts.reactiveCompactOpts ?? reactiveCompactDefault,
+    onTurnStart: opts.onTurnStart,
+    onTurnEnd: opts.onTurnEnd,
+    onToolCall: opts.onToolCall,
+    onToolSuccess: opts.onToolSuccess,
+    onToolError: opts.onToolError,
+  };
 
   for (let iter = 1; iter <= maxIterations; iter++) {
-    // Rebuild per-turn: always-load tools + ToolSearch + any deferred tools
-    // discovered so far. Prefix is stable until a new discovery, so
-    // post-discovery turns share a cache prefix.
-    const turnTools = assembleTurnTools(opts.tools, loopTools, discovery);
-
-    opts.onTurnStart?.(iter);
-    const response = await client.messages.create({
-      model: opts.model,
-      max_tokens: maxTokens,
-      system: systemParams,
-      tools: buildToolParams(turnTools),
-      messages,
-    });
-    opts.onTurnEnd?.(iter, {
-      stopReason: response.stop_reason,
-      textPreview: extractText(response.content).slice(0, 200),
-      toolCallCount: response.content.filter((b) => b.type === "tool_use")
-        .length,
-      inputTokens: response.usage.input_tokens,
-      outputTokens: response.usage.output_tokens,
-      cacheReadTokens: response.usage.cache_read_input_tokens ?? 0,
-      cacheCreationTokens: response.usage.cache_creation_input_tokens ?? 0,
-    });
-
-    usage.input_tokens += response.usage.input_tokens;
-    usage.output_tokens += response.usage.output_tokens;
-    usage.cache_creation_input_tokens +=
-      response.usage.cache_creation_input_tokens ?? 0;
-    usage.cache_read_input_tokens +=
-      response.usage.cache_read_input_tokens ?? 0;
-
-    // §A — turn-boundary compaction. Order matters:
-    //   1. Check whether we're past the autoCompact trigger; if so,
-    //      rewrite older messages into a single boundary message.
-    //   2. Run microCompact — idempotent, replaces dead-weight analysis
-    //      tool_result blocks with a one-liner once an EditPlan exists.
-    // Both run AFTER the assistant turn has been appended (later in the
-    // iteration). The trigger we check here is on the response we just got
-    // — if input_tokens is already above the budget, we want the NEXT API
-    // call to use compacted messages.
-    const limit = opts.modelContextLimit ?? DEFAULT_MODEL_CONTEXT_LIMIT;
-    const compactResult = await checkAutoCompact(
-      {
-        modelContextLimit: limit,
-        lastInputTokens: response.usage.input_tokens,
-        remainingTokens: limit - response.usage.input_tokens,
-        turnIndex: iter,
-      },
-      opts.compactStrategy,
-      (s) => {
-        if (process.env.VIDEO_AGENT_VERBOSE === "1") {
-          console.warn(
-            `[autoCompact] WARNING — ${s.remainingTokens} tokens remain (warning buffer ${s.bufferTokens})`,
-          );
-        }
-      },
-    );
-
-    if (
-      response.stop_reason === "end_turn" ||
-      response.stop_reason === "stop_sequence"
-    ) {
+    const result = await runOneTurnCycle(state, cycleOpts, iter);
+    if (result.done) {
       return {
-        finalText: extractText(response.content),
+        finalText: result.finalText,
         iterations: iter,
-        totalUsage: usage,
-        toolCallsByName,
+        totalUsage: state.usage,
+        toolCallsByName: state.toolCallsByName,
       };
     }
+  }
 
-    if (response.stop_reason === "max_tokens") {
-      throw new Error(
-        `runAgentLoop: model hit max_tokens at iteration ${iter}`,
-      );
-    }
+  throw new Error(
+    `runAgentLoop: exceeded ${maxIterations} iterations without end_turn`,
+  );
+}
 
-    if (response.stop_reason !== "tool_use") {
-      throw new Error(
-        `runAgentLoop: unexpected stop_reason ${response.stop_reason}`,
-      );
-    }
+// One model call + tool dispatch round + turn-boundary compaction.
+// Mutates `state.messages` in place (autoCompact may rewrite the array,
+// in which case we replace the property). Returns:
+//   { done: true, finalText } on end_turn / stop_sequence
+//   { done: false }            on tool_use (caller should re-invoke)
+// Throws on max_tokens or any other unexpected stop reason.
+export async function runOneTurnCycle(
+  state: TurnState,
+  opts: TurnCycleOpts,
+  iter: number,
+): Promise<TurnCycleResult> {
+  // Rebuild per-turn: always-load tools + ToolSearch + any deferred tools
+  // discovered so far. Prefix is stable until a new discovery, so
+  // post-discovery turns share a cache prefix.
+  const turnTools = assembleTurnTools(opts.tools, opts.loopTools, state.discovery);
 
-    // Echo assistant turn back into history.
-    messages.push({ role: "assistant", content: response.content });
+  opts.onTurnStart?.(iter);
+  // Wire ctx.abortSignal into the SDK call. Without this, Ctrl-C in chat
+  // mode wouldn't cancel an in-flight model request — the loop would only
+  // notice the abort once dispatch started.
+  const response = await opts.client.messages.create(
+    {
+      model: opts.model,
+      max_tokens: opts.maxTokens,
+      system: opts.systemParams,
+      tools: buildToolParams(turnTools),
+      messages: state.messages,
+    },
+    { signal: opts.ctx.abortSignal },
+  );
+  opts.onTurnEnd?.(iter, {
+    stopReason: response.stop_reason,
+    textPreview: extractText(response.content).slice(0, 200),
+    toolCallCount: response.content.filter((b) => b.type === "tool_use")
+      .length,
+    inputTokens: response.usage.input_tokens,
+    outputTokens: response.usage.output_tokens,
+    cacheReadTokens: response.usage.cache_read_input_tokens ?? 0,
+    cacheCreationTokens: response.usage.cache_creation_input_tokens ?? 0,
+  });
 
-    // Dispatch every tool_use block in the assistant turn.
-    const toolResults: ToolResultBlockParam[] = [];
-    for (const block of response.content) {
-      if (block.type !== "tool_use") continue;
+  state.usage.input_tokens += response.usage.input_tokens;
+  state.usage.output_tokens += response.usage.output_tokens;
+  state.usage.cache_creation_input_tokens +=
+    response.usage.cache_creation_input_tokens ?? 0;
+  state.usage.cache_read_input_tokens +=
+    response.usage.cache_read_input_tokens ?? 0;
+
+  // §A — turn-boundary compaction. Order matters:
+  //   1. Check whether we're past the autoCompact trigger; if so,
+  //      rewrite older messages into a single boundary message.
+  //   2. Run microCompact — idempotent, replaces dead-weight analysis
+  //      tool_result blocks with a one-liner once an EditPlan exists.
+  // Both run AFTER the assistant turn has been appended (later in the
+  // iteration). The trigger we check here is on the response we just got
+  // — if input_tokens is already above the budget, we want the NEXT API
+  // call to use compacted messages.
+  const compactResult = await checkAutoCompact(
+    {
+      modelContextLimit: opts.modelContextLimit,
+      lastInputTokens: response.usage.input_tokens,
+      remainingTokens: opts.modelContextLimit - response.usage.input_tokens,
+      turnIndex: iter,
+    },
+    opts.compactStrategy,
+    (s) => {
+      if (process.env.VIDEO_AGENT_VERBOSE === "1") {
+        console.warn(
+          `[autoCompact] WARNING — ${s.remainingTokens} tokens remain (warning buffer ${s.bufferTokens})`,
+        );
+      }
+    },
+  );
+
+  if (
+    response.stop_reason === "end_turn" ||
+    response.stop_reason === "stop_sequence"
+  ) {
+    return { done: true, finalText: extractText(response.content) };
+  }
+
+  if (response.stop_reason === "max_tokens") {
+    throw new Error(
+      `runAgentLoop: model hit max_tokens at iteration ${iter}`,
+    );
+  }
+
+  if (response.stop_reason !== "tool_use") {
+    throw new Error(
+      `runAgentLoop: unexpected stop_reason ${response.stop_reason}`,
+    );
+  }
+
+  // Echo assistant turn back into history.
+  state.messages.push({ role: "assistant", content: response.content });
+
+  // Dispatch every tool_use block in the assistant turn.
+  const toolUseBlocks = response.content.filter(
+    (b): b is ToolUseBlock => b.type === "tool_use",
+  );
+  const toolResults: ToolResultBlockParam[] = [];
+  let dispatchError: unknown = undefined;
+
+  for (const block of toolUseBlocks) {
+    // Stop early if the user cancelled — let the synthetic-result loop
+    // below fill in stubs for the remaining blocks so the messages array
+    // stays valid for the next API call.
+    if (opts.ctx.abortSignal.aborted) break;
+    try {
       const result = await dispatchOne(
         block,
         turnTools,
@@ -234,7 +326,7 @@ export async function runAgentLoop(opts: RunOpts): Promise<RunResult> {
         opts.hooks,
         opts.onToolCall,
         opts.onToolSuccess,
-        reactiveOpts,
+        opts.reactiveOpts,
       );
       // Surface tool failures (is_error true) to the UI hook so the
       // renderer can show ✗ instead of ✓.
@@ -246,31 +338,52 @@ export async function runAgentLoop(opts: RunOpts): Promise<RunResult> {
         opts.onToolError(block.name, result.content);
       }
       toolResults.push(result);
-      toolCallsByName[block.name] = (toolCallsByName[block.name] ?? 0) + 1;
-    }
-    messages.push({ role: "user", content: toolResults });
-
-    // §A — end-of-turn compaction. autoCompact rewrites old turns first
-    // (so microCompact's pattern matching runs against the smaller array);
-    // microCompact then drops any superseded analysis blocks.
-    if (compactResult.signal.kind === "trigger") {
-      const r = await performAutoCompact(messages, opts.compactStrategy);
-      if (r.compacted) {
-        messages = [...r.messages];
-        console.warn(
-          `[autoCompact] rewrote — dropped ${r.droppedCount} earlier message(s)`,
-        );
-      }
-    }
-    const micro = microCompact(messages);
-    if (micro.rewroteCount > 0) {
-      messages = [...micro.messages];
+      state.toolCallsByName[block.name] =
+        (state.toolCallsByName[block.name] ?? 0) + 1;
+    } catch (e) {
+      dispatchError = e;
+      break;
     }
   }
 
-  throw new Error(
-    `runAgentLoop: exceeded ${maxIterations} iterations without end_turn`,
-  );
+  // Anthropic requires every tool_use block to be matched by a tool_result
+  // block in the next user message. If we aborted (or a hook threw) before
+  // completing all blocks, fill the gap with synthetic is_error stubs so
+  // the message array is still valid — the conversation can continue
+  // cleanly on the next user message.
+  for (let i = toolResults.length; i < toolUseBlocks.length; i++) {
+    toolResults.push({
+      type: "tool_result",
+      tool_use_id: toolUseBlocks[i]!.id,
+      content: "[user cancelled]",
+      is_error: true,
+    });
+  }
+  state.messages.push({ role: "user", content: toolResults });
+
+  if (dispatchError !== undefined) throw dispatchError;
+  if (opts.ctx.abortSignal.aborted) {
+    throw new DOMException("turn aborted by user", "AbortError");
+  }
+
+  // §A — end-of-turn compaction. autoCompact rewrites old turns first
+  // (so microCompact's pattern matching runs against the smaller array);
+  // microCompact then drops any superseded analysis blocks.
+  if (compactResult.signal.kind === "trigger") {
+    const r = await performAutoCompact(state.messages, opts.compactStrategy);
+    if (r.compacted) {
+      state.messages = [...r.messages];
+      console.warn(
+        `[autoCompact] rewrote — dropped ${r.droppedCount} earlier message(s)`,
+      );
+    }
+  }
+  const micro = microCompact(state.messages);
+  if (micro.rewroteCount > 0) {
+    state.messages = [...micro.messages];
+  }
+
+  return { done: false };
 }
 
 async function dispatchOne(
@@ -446,7 +559,11 @@ function errResult(id: string, msg: string): ToolResultBlockParam {
 // Plan §I — apply cache_control to the LAST stable block. Everything before
 // it is implicitly cached up to that breakpoint. Dynamic blocks come after
 // and are not cached.
-function buildSystemParams(blocks: readonly ContextBlock[]): TextBlockParam[] {
+// Exported so Conversation (chat mode) can build the same cached system
+// params once at session start without re-implementing the cache rules.
+export function buildSystemParams(
+  blocks: readonly ContextBlock[],
+): TextBlockParam[] {
   const lastStableIdx = lastIndexOf(blocks, (b) => b.kind === "stable");
   return blocks.map((b, i): TextBlockParam => {
     const base: TextBlockParam = { type: "text", text: b.content };
@@ -502,7 +619,7 @@ function lastIndexOf<T>(arr: readonly T[], pred: (t: T) => boolean): number {
 function assembleTurnTools(
   registry: readonly Tool[],
   loopTools: readonly Tool[],
-  discovery: { discovered: Set<string> },
+  discovery: ToolDiscovery,
 ): readonly Tool[] {
   const turnTools: Tool[] = [];
   for (const t of registry) {

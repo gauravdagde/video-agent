@@ -94,6 +94,65 @@ Tokens:  { input_tokens: …, output_tokens: …, cache_read_input_tokens: … }
 Tool calls: { VideoAnalyse: 1, SceneDetect: 1, ExitPlanMode: 1, TrimClip: 4, RenderVariant: 2, … }
 ```
 
+### Chat mode (interactive REPL)
+
+Like `--execute`, but the conversation persists — you ask, the agent
+acts, you ask the next thing, the agent retains everything. Plan-mode
+approval becomes a y/N prompt at the terminal instead of an auto-approve.
+
+```bash
+bun run dev -- --chat                          # demo source video
+bun run dev -- --chat --source ~/path/ad.mp4   # your own video
+```
+
+Inside the REPL:
+
+```
+❯ analyse @~/Downloads/ad.mp4
+… (agent runs VideoAnalyse / SceneDetect / RichAnalysis / OCR / VLM)
+❯ now do a 15s tiktok variant — emphasise the climax around 00:18
+… (agent calls EnterPlanMode → ExitPlanMode → submits a plan)
+Plan submitted
+  1 plan:
+    1. demo-spec-tiktok  (3 scenes, 2 overlays, 15.0s, audio=original)
+Approve and render? [y/N] y
+… (renders + writes batch.json + variant sidecars)
+❯ now do an instagram reel version, 12s
+… (agent re-enters plan mode; fresh y/N prompt; renders again)
+```
+
+Slash commands inside chat:
+
+| Command | Effect |
+|---|---|
+| `/help` | Show commands + session stats (tokens, tool calls, variants). |
+| `/clear` | Reset conversation (messages, discovery, plan state). Keeps brand/campaign/asset. |
+| `/exit` | End the session. Same as `Ctrl-D`. |
+
+References:
+
+- `@/abs/path`, `@~/foo`, `@./bar` — expanded inline to absolute paths
+  before the message reaches the model. Anything else with `@` (emails,
+  `@everyone`, …) passes through untouched.
+
+Interrupting:
+
+- **Ctrl-C during a turn** — cancels the in-flight model call + any
+  pending tool dispatches. The conversation stays valid (synthetic
+  `tool_result` stubs fill any unfinished `tool_use` blocks) and you can
+  send the next message.
+- **Ctrl-C twice within 2s** — force-exit (use only if a hung tool
+  ignores the abort signal).
+- **Ctrl-C at the prompt** — graceful exit, same as `/exit`.
+
+Per-message persistence:
+
+- After each user message that produced renders, EditPlan sidecars +
+  `batch.json` flush to disk under `storage/<brand>/<campaign>/<asset>/`.
+  Files are visible between messages and Ctrl-C-survivable.
+- The accumulated batch is rewritten each flush — `batch.json` always
+  reflects every variant rendered in the session so far.
+
 ### Opt in to the real ComplianceAgent
 
 By default `compliance` is the always-pass stub. To run the actual ComplianceAgent (forks per render — costs more tokens):

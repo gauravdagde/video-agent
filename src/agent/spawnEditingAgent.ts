@@ -116,7 +116,7 @@ export async function spawnEditingAgent(brief: EditingBrief): Promise<SpawnResul
       model: DEFAULT_MODEL,
       systemBlocks,
       tools: editingAgentTools,
-      extraLoopTools: [buildEnterPlanModeTool(), exitPlanMode],
+      extraLoopTools: [buildEnterPlanModeTool(planApproval), exitPlanMode],
       initialMessage,
       ctx: {
         agentId,
@@ -166,7 +166,7 @@ export async function spawnEditingAgent(brief: EditingBrief): Promise<SpawnResul
             rendered_at_ms: Date.now(),
           });
         }
-        brief.ui?.toolSuccess(name);
+        brief.ui?.toolSuccess(name, output);
       },
       onToolError: (name, error) => brief.ui?.toolError(name, error),
       onTurnStart: (turn) => brief.ui?.turnStart(turn),

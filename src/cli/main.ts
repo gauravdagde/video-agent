@@ -1,4 +1,4 @@
-// Phase 1 entrypoint. Five modes:
+// Phase 1 entrypoint. Six modes:
 //   bun run dev                                  — dry run: assemble context + tool params, print, exit
 //   bun run dev -- --prep                        — generate a synthetic source.mp4 at the demo asset path
 //   bun run dev -- --analyse <path>              — analyse a video: VideoAnalyse + SceneDetect + RichAnalysis
@@ -6,13 +6,20 @@
 //                                                  Add --no-vision to skip the VLM pass.
 //   bun run dev -- --execute                     — call Claude with the editing brief on the demo source
 //   bun run dev -- --execute --source <p>        — same, but with YOUR video at <p>
+//   bun run dev -- --chat                        — open a chat-mode REPL (like Claude Code). Type to interact;
+//                                                  /help for commands, /exit to quit. Combine with --source <p>.
 //
 // Typical first-time flow:
 //   bun run dev -- --prep && export ANTHROPIC_API_KEY=… && bun run dev -- --execute
 // Analyse your own footage (vision included automatically):
 //   export ANTHROPIC_API_KEY=… && bun run dev -- --analyse ~/Downloads/ad.mp4
+// Chat with the agent:
+//   export ANTHROPIC_API_KEY=… && bun run dev -- --chat --source ~/Downloads/ad.mp4
 
 import { existsSync } from "node:fs";
+import { Conversation } from "../chat/Conversation.ts";
+import { createChatPlanApprover } from "../chat/approver.ts";
+import { runRepl } from "../chat/repl.ts";
 import { editingAgentCompactStrategy } from "../compact/CompactStrategy.ts";
 import { buildEditingAgentContext } from "../context/buildEditingAgentContext.ts";
 import { spawnEditingAgent } from "../agent/spawnEditingAgent.ts";
@@ -64,6 +71,11 @@ async function main(): Promise<void> {
     }
     const noVision = args.includes("--no-vision");
     await analyse(target, !noVision);
+    return;
+  }
+
+  if (args.includes("--chat")) {
+    await chat(args);
     return;
   }
 
@@ -688,6 +700,61 @@ async function ingestSource(targetPath: string): Promise<void> {
   console.log(
     `Ingested ${targetPath} → ${dest} (${(r.output.duration_ms / 1000).toFixed(1)}s, ${r.output.resolution.width}x${r.output.resolution.height})`,
   );
+}
+
+// --chat — open a chat-mode REPL backed by the EditingAgent loop. Reuses
+// the same tools, hooks, compaction, and plan-mode gate as --execute,
+// but the conversation persists across user messages and renders flush
+// to disk per message.
+async function chat(args: readonly string[]): Promise<void> {
+  if (!process.env.ANTHROPIC_API_KEY) {
+    console.error(
+      "ANTHROPIC_API_KEY not set. Chat mode needs the Anthropic SDK.",
+    );
+    process.exit(1);
+  }
+
+  // Optional --source <path> swaps in user footage at the demo asset
+  // path before the session starts (same shape as --execute).
+  const sourceIdx = args.indexOf("--source");
+  if (sourceIdx >= 0) {
+    const target = args[sourceIdx + 1];
+    if (target === undefined) {
+      console.error("--source requires a path argument");
+      process.exit(1);
+    }
+    await ingestSource(target);
+  }
+
+  const sourcePath = storagePaths.assetSource(BRAND, CAMPAIGN, ASSET);
+  if (!existsSync(sourcePath)) {
+    console.error(
+      `Source video missing: ${sourcePath}\n` +
+        "Either:\n" +
+        "  • bun run dev -- --prep                       (synthetic source)\n" +
+        "  • bun run dev -- --chat --source <path>       (your own video)",
+    );
+    process.exit(1);
+  }
+
+  const ui = createCliRenderer({ quietPreview: true });
+  const approver = createChatPlanApprover({ ui });
+  const conversation = await Conversation.create({
+    brandId: BRAND,
+    campaignId: CAMPAIGN,
+    assetId: ASSET,
+    approvePlans: approver,
+    ui,
+  });
+
+  await runRepl({
+    conversation,
+    ui,
+    brandId: BRAND,
+    campaignId: CAMPAIGN,
+    assetId: ASSET,
+    backendLabel: process.env.MODEL ?? "claude-opus-4-7",
+  });
 }
 
 async function dryRun(): Promise<void> {

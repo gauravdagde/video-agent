@@ -1,13 +1,21 @@
-// Minimal Claude-Code-style CLI renderer. ANSI escape codes only — no
-// `ink`, no `ora`, no `chalk`. Goals:
-//   - Live spinner while the model is "thinking" (between API call start
-//     and response).
-//   - Per-tool-call line: "→ ToolName(args summary)" then "✓ in N ms" or "✗ error".
-//   - Per-turn header: "Turn 3 — 2 tool calls, 4234 in / 312 out tokens".
-//   - Final summary block.
+// Claude-Code-style CLI renderer. ANSI escape codes only — no `ink`,
+// no `ora`, no `chalk`. Visual conventions:
 //
-// Single-line interactive updates use \r + \x1B[K (clear-to-EOL). Once a
-// line is "committed" (succeed/fail/info), it gets a newline and stays.
+//   ● VideoAnalyse(source_path: …)             ← bullet + tool + args
+//     └ duration 30000ms · 1920×1080 · 30 fps  ← tree-prefix continuation
+//
+// While a tool is running:
+//
+//   ● VideoAnalyse(source_path: …)
+//     └ running… (3.4s)                         ← live, replaced on success
+//
+// Between tool calls (model is generating its next turn):
+//
+//   ✻ Pondering… (12s · ↑ 1.2k / ↓ 0.4k tokens · turn 3)
+//
+// The "live line" sits at the bottom of the output buffer; \r + clear-EOL
+// updates it in place each spinner tick. Completed events are written
+// ABOVE the live line via printAbove() (clear, write+newline, redraw).
 
 const ESC = "\x1B[";
 const RESET = `${ESC}0m`;
@@ -24,10 +32,11 @@ const CLEAR_LINE = `\r${ESC}K`;
 const HIDE_CURSOR = `${ESC}?25l`;
 const SHOW_CURSOR = `${ESC}?25h`;
 
-const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER = ["✻", "✽", "✶", "✷", "✸", "✹"];
+const BULLET = "●";
+const CONT = "└";
 const TICK = "✓";
 const CROSS = "✗";
-const ARROW = "→";
 
 // Tool kinds for colouring. Read = cyan, write = yellow, render = magenta,
 // control-plane (ToolSearch / ExitPlanMode / etc.) = grey.
@@ -36,6 +45,9 @@ const READ_TOOLS = new Set([
   "SceneDetect",
   "TranscriptExtract",
   "ExtractFrames",
+  "DescribeScenes",
+  "RichAnalysis",
+  "OCR",
 ]);
 const RENDER_TOOLS = new Set([
   "RenderVariant",
@@ -70,7 +82,7 @@ export interface CliRenderer {
     },
   ): void;
   toolCall(name: string, input: unknown): void;
-  toolSuccess(name: string): void;
+  toolSuccess(name: string, output?: unknown): void;
   toolError(name: string, error: string): void;
   info(line: string): void;
   warn(line: string): void;
@@ -96,18 +108,36 @@ export interface FinalSummary {
   readonly extras?: Readonly<Record<string, string | number>>;
 }
 
-export function createCliRenderer(opts: { stream?: NodeJS.WriteStream } = {}): CliRenderer {
+export function createCliRenderer(opts: {
+  readonly stream?: NodeJS.WriteStream;
+  // Chat-mode flag: skip the truncated text preview under each turn
+  // header. The REPL prints the full assistant text after the turn ends,
+  // and the preview would just duplicate the first ~200 chars.
+  readonly quietPreview?: boolean;
+} = {}): CliRenderer {
   const stream = opts.stream ?? process.stdout;
   const isTTY = stream.isTTY === true;
+  const quietPreview = opts.quietPreview === true;
+
+  // Spinner state. The "live line" is whatever is currently rendered at
+  // the bottom of the terminal — either the per-tool "running…" line or
+  // the between-turn "Pondering…" indicator.
   let spinnerFrame = 0;
   let spinnerTimer: Timer | null = null;
   let spinnerActive = false;
-  let spinnerLabel = "";
-  let turnStartedAt = 0;
-  // Track open tool-call lines so we can update them in place.
-  const openToolCalls = new Map<string, { startedAt: number; line: string }>();
-  // Currently displayed live line at the bottom of the output.
   let liveLine: string | null = null;
+
+  // The currently-running tool call. We render its `└ running… (Ns)`
+  // line in place each frame, then replace it with the result summary
+  // when toolSuccess/toolError fires.
+  let runningTool: { name: string; startedAt: number } | null = null;
+
+  // Between-turn pondering state. Tracks elapsed + cumulative tokens for
+  // the live status line.
+  let ponderingStartedAt: number | null = null;
+  let ponderingTurn = 0;
+  let cumulativeIn = 0;
+  let cumulativeOut = 0;
 
   const write = (s: string): void => {
     stream.write(s);
@@ -128,34 +158,50 @@ export function createCliRenderer(opts: { stream?: NodeJS.WriteStream } = {}): C
   };
 
   const printAbove = (line: string): void => {
-    // Clear the live line, print our message, then redraw the live line.
     if (isTTY) write(CLEAR_LINE);
     write(line + "\n");
     renderLive();
   };
 
-  const startSpinner = (label: string): void => {
-    spinnerLabel = label;
-    spinnerActive = true;
-    if (!isTTY) {
-      // Non-TTY: just print the label once, no animation.
-      write(`  ${label}\n`);
-      return;
-    }
-    write(HIDE_CURSOR);
-    if (spinnerTimer === null) {
-      spinnerTimer = setInterval(() => {
-        if (!spinnerActive) return;
-        spinnerFrame = (spinnerFrame + 1) % SPINNER.length;
-        const elapsed = ((Date.now() - turnStartedAt) / 1000).toFixed(1);
-        setLive(
-          `${CYAN}${SPINNER[spinnerFrame]}${RESET} ${spinnerLabel} ${GREY}(${elapsed}s)${RESET}`,
-        );
-      }, 80);
+  const formatPondering = (): string => {
+    const startedAt = ponderingStartedAt ?? Date.now();
+    const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
+    const inK = (cumulativeIn / 1000).toFixed(1);
+    const outK = (cumulativeOut / 1000).toFixed(1);
+    const tokens =
+      cumulativeIn === 0 && cumulativeOut === 0
+        ? ""
+        : ` ${GREY}·${RESET} ${GREY}↑${RESET} ${inK}k ${GREY}/${RESET} ${GREY}↓${RESET} ${outK}k tokens`;
+    const sym = SPINNER[spinnerFrame % SPINNER.length];
+    return `${MAGENTA}${sym}${RESET} ${BOLD}Pondering…${RESET} ${GREY}(${elapsed}s${RESET}${tokens}${GREY} · turn ${ponderingTurn})${RESET}`;
+  };
+
+  const formatToolRunning = (): string => {
+    if (runningTool === null) return "";
+    const elapsed = ((Date.now() - runningTool.startedAt) / 1000).toFixed(1);
+    return `  ${GREY}${CONT} running… (${elapsed}s)${RESET}`;
+  };
+
+  // Single timer; it picks which live line to render based on which
+  // state is active (running tool > pondering > nothing).
+  const tickLive = (): void => {
+    spinnerFrame = (spinnerFrame + 1) % SPINNER.length;
+    if (runningTool !== null) {
+      setLive(formatToolRunning());
+    } else if (ponderingStartedAt !== null) {
+      setLive(formatPondering());
     }
   };
 
-  const stopSpinner = (): void => {
+  const ensureTimer = (): void => {
+    if (!isTTY) return;
+    if (spinnerTimer !== null) return;
+    write(HIDE_CURSOR);
+    spinnerActive = true;
+    spinnerTimer = setInterval(tickLive, 120);
+  };
+
+  const stopTimer = (): void => {
     spinnerActive = false;
     if (spinnerTimer !== null) {
       clearInterval(spinnerTimer);
@@ -167,8 +213,7 @@ export function createCliRenderer(opts: { stream?: NodeJS.WriteStream } = {}): C
 
   return {
     banner(title, subtitle) {
-      const top = `${BOLD}${title}${RESET}`;
-      printAbove(top);
+      printAbove(`${BOLD}${title}${RESET}`);
       if (subtitle !== undefined) {
         printAbove(`${GREY}${subtitle}${RESET}`);
       }
@@ -176,88 +221,106 @@ export function createCliRenderer(opts: { stream?: NodeJS.WriteStream } = {}): C
     },
 
     turnStart(turn) {
-      turnStartedAt = Date.now();
-      startSpinner(`Turn ${turn}: thinking…`);
+      ponderingStartedAt = Date.now();
+      ponderingTurn = turn;
+      runningTool = null;
+      ensureTimer();
     },
 
     turnEnd(turn, info) {
-      stopSpinner();
-      const elapsed = ((Date.now() - turnStartedAt) / 1000).toFixed(1);
+      cumulativeIn += info.inputTokens;
+      cumulativeOut += info.outputTokens;
+      ponderingStartedAt = null;
+      // If a tool is running, keep the timer alive — it'll be stopped
+      // when toolSuccess/toolError fires.
+      if (runningTool === null) stopTimer();
+
+      const elapsed = ponderingStartedAt
+        ? ((Date.now() - ponderingStartedAt) / 1000).toFixed(1)
+        : "";
       const cacheNote =
         info.cacheReadTokens > 0
-          ? `, ${GREEN}${info.cacheReadTokens}${RESET} cached`
+          ? ` ${GREY}·${RESET} ${GREEN}${info.cacheReadTokens} cached${RESET}`
           : "";
+      const counts = `${info.toolCallCount} tool call${info.toolCallCount === 1 ? "" : "s"}`;
       const turnLine =
-        `${BOLD}Turn ${turn}${RESET} ` +
-        `${GREY}— ${info.toolCallCount} tool call${info.toolCallCount === 1 ? "" : "s"}, ` +
-        `${info.inputTokens} in / ${info.outputTokens} out${cacheNote}, ` +
-        `${elapsed}s${RESET}`;
+        `${GREY}turn ${turn} · ${counts} · ` +
+        `${info.inputTokens} in / ${info.outputTokens} out${RESET}` +
+        cacheNote +
+        (elapsed ? ` ${GREY}· ${elapsed}s${RESET}` : "");
       printAbove(turnLine);
-      // Print the model's text preview indented under the turn header.
-      const preview = info.textPreview.trim();
-      if (preview.length > 0) {
-        for (const line of preview.split("\n").slice(0, 3)) {
-          printAbove(`  ${DIM}${line}${RESET}`);
+
+      if (!quietPreview) {
+        const preview = info.textPreview.trim();
+        if (preview.length > 0) {
+          for (const line of preview.split("\n").slice(0, 3)) {
+            printAbove(`  ${DIM}${line}${RESET}`);
+          }
         }
       }
     },
 
     toolCall(name, input) {
+      // Stop the pondering timer (we'll restart it when the tool ends).
+      ponderingStartedAt = null;
       const colour = colourForTool(name);
-      const summary = summariseInput(input);
-      const startedAt = Date.now();
-      const line = `  ${colour}${ARROW} ${name}${RESET}${summary}`;
-      openToolCalls.set(name + ":" + startedAt, { startedAt, line });
-      printAbove(line);
-      // Spinner for the tool call itself.
-      turnStartedAt = startedAt;
-      startSpinner(`${name} running…`);
+      const argsBlurb = summariseInput(input);
+      const header = `${colour}${BULLET}${RESET} ${BOLD}${name}${RESET}${argsBlurb}`;
+      printAbove(header);
+      runningTool = { name, startedAt: Date.now() };
+      ensureTimer();
     },
 
-    toolSuccess(name) {
-      stopSpinner();
-      // Find the most recent open call with this name.
-      let matchedKey: string | null = null;
-      let bestTime = -1;
-      for (const [k, v] of openToolCalls) {
-        if (k.startsWith(name + ":") && v.startedAt > bestTime) {
-          matchedKey = k;
-          bestTime = v.startedAt;
-        }
+    toolSuccess(name, output) {
+      if (runningTool !== null && runningTool.name === name) {
+        const ms = Date.now() - runningTool.startedAt;
+        runningTool = null;
+        const summary = summariseOutput(name, output);
+        const detail =
+          summary.length > 0 ? `${summary} ${GREY}(${ms}ms)${RESET}` : `${GREEN}${TICK}${RESET} ${GREY}(${ms}ms)${RESET}`;
+        printAbove(`  ${GREY}${CONT}${RESET} ${detail}`);
+      } else {
+        // Fallback path: toolSuccess fired without a matching toolCall
+        // (the analyse-mode CLI calls these directly).
+        const summary = summariseOutput(name, output);
+        const line =
+          summary.length > 0
+            ? `  ${GREY}${CONT}${RESET} ${summary}`
+            : `  ${GREEN}${TICK}${RESET} ${GREY}${name}${RESET}`;
+        printAbove(line);
       }
-      if (matchedKey !== null) openToolCalls.delete(matchedKey);
-      const ms = bestTime > 0 ? Date.now() - bestTime : 0;
-      const colour = colourForTool(name);
-      printAbove(
-        `  ${GREEN}${TICK}${RESET} ${colour}${name}${RESET} ${GREY}(${ms}ms)${RESET}`,
-      );
+      // If we just finished a tool but the model hasn't returned yet,
+      // resume the pondering indicator so the bottom line stays alive.
+      if (runningTool === null && ponderingStartedAt === null) {
+        // Don't auto-resume here — turnEnd is already past, and the
+        // next turnStart will start a fresh pondering line. Simply stop.
+        if (spinnerActive) stopTimer();
+      }
     },
 
     toolError(name, error) {
-      stopSpinner();
-      let matchedKey: string | null = null;
-      let bestTime = -1;
-      for (const [k, v] of openToolCalls) {
-        if (k.startsWith(name + ":") && v.startedAt > bestTime) {
-          matchedKey = k;
-          bestTime = v.startedAt;
-        }
-      }
-      if (matchedKey !== null) openToolCalls.delete(matchedKey);
+      const ms =
+        runningTool !== null && runningTool.name === name
+          ? Date.now() - runningTool.startedAt
+          : 0;
+      runningTool = null;
       const truncated = error.length > 200 ? error.slice(0, 200) + "…" : error;
-      printAbove(`  ${RED}${CROSS} ${name}${RESET} ${RED}${truncated}${RESET}`);
+      const detail = `${RED}${CROSS} ${truncated}${RESET}` +
+        (ms > 0 ? ` ${GREY}(${ms}ms)${RESET}` : "");
+      printAbove(`  ${GREY}${CONT}${RESET} ${detail}`);
+      if (spinnerActive && ponderingStartedAt === null) stopTimer();
     },
 
     info(line) {
-      printAbove(`  ${BLUE}${ARROW}${RESET} ${line}`);
+      printAbove(`${BLUE}${BULLET}${RESET} ${line}`);
     },
 
     warn(line) {
-      printAbove(`  ${YELLOW}!${RESET} ${line}`);
+      printAbove(`${YELLOW}${BULLET}${RESET} ${line}`);
     },
 
     finish(summary) {
-      stopSpinner();
+      stopTimer();
       const elapsedSec = (summary.elapsedMs / 1000).toFixed(1);
       const status =
         summary.status === "succeeded" ? `${GREEN}${summary.status}${RESET}` :
@@ -292,7 +355,7 @@ export function createCliRenderer(opts: { stream?: NodeJS.WriteStream } = {}): C
     },
 
     fail(error) {
-      stopSpinner();
+      stopTimer();
       printAbove("");
       printAbove(`${RED}${CROSS} ${BOLD}Failed${RESET}: ${RED}${error.message}${RESET}`);
     },
@@ -309,20 +372,137 @@ export function createCliRenderer(opts: { stream?: NodeJS.WriteStream } = {}): C
   };
 }
 
+// Compact one-line summary of a tool's input. Shows the 1-3 most useful
+// fields rather than the full JSON, which would line-wrap and obscure
+// the bullet structure.
 function summariseInput(input: unknown): string {
   if (input === null || input === undefined) return "";
   if (typeof input !== "object") {
-    return ` ${GREY}${truncate(String(input), 60)}${RESET}`;
+    return ` ${GREY}(${truncate(String(input), 60)})${RESET}`;
   }
   const o = input as Record<string, unknown>;
   const keys = Object.keys(o);
   if (keys.length === 0) return "";
-  // Pick a few interesting fields to surface in the line.
   const interesting = keys
     .slice(0, 3)
-    .map((k) => `${k}=${truncate(formatValue(o[k]), 30)}`)
+    .map((k) => `${k}: ${truncate(formatValue(o[k]), 30)}`)
     .join(", ");
   return ` ${GREY}(${interesting})${RESET}`;
+}
+
+// Per-tool one-line result summary. Pulls the load-bearing fields out
+// of each tool's output so the user doesn't have to mentally parse JSON
+// to know what happened. Falls back to "ok" when the tool isn't known.
+function summariseOutput(name: string, output: unknown): string {
+  if (output === null || output === undefined) return "";
+  const o =
+    typeof output === "object" ? (output as Record<string, unknown>) : null;
+  switch (name) {
+    case "VideoAnalyse": {
+      if (o === null) break;
+      const dur = o.duration_ms;
+      const res = o.resolution as { width?: number; height?: number } | undefined;
+      const fps = o.frame_rate;
+      const audio = o.has_audio === true ? "audio" : "no audio";
+      return [
+        dur !== undefined ? `${ms(dur as number)}` : null,
+        res !== undefined && res.width !== undefined
+          ? `${res.width}×${res.height}`
+          : null,
+        fps !== undefined ? `${fps} fps` : null,
+        audio,
+      ]
+        .filter((x): x is string => x !== null)
+        .join(GREY + " · " + RESET);
+    }
+    case "SceneDetect": {
+      if (o === null) break;
+      const scenes = o.scenes as unknown[] | undefined;
+      if (Array.isArray(scenes)) return `${scenes.length} scenes`;
+      break;
+    }
+    case "TranscriptExtract": {
+      if (o === null) break;
+      const words = o.words as unknown[] | undefined;
+      if (Array.isArray(words)) return `${words.length} words`;
+      break;
+    }
+    case "DescribeScenes": {
+      if (o === null) break;
+      const d = o.descriptions as unknown[] | undefined;
+      if (Array.isArray(d)) return `${d.length} scenes described`;
+      break;
+    }
+    case "ExtractFrames": {
+      if (o === null) break;
+      const f = o.frames as unknown[] | undefined;
+      if (Array.isArray(f)) return `${f.length} frames`;
+      break;
+    }
+    case "TrimClip": {
+      if (o === null) break;
+      const out = o.output_path as string | undefined;
+      if (typeof out === "string") return `→ ${shortPath(out)}`;
+      break;
+    }
+    case "OverlayAsset": {
+      if (o === null) break;
+      const out = o.output_path as string | undefined;
+      if (typeof out === "string") return `→ ${shortPath(out)}`;
+      break;
+    }
+    case "AdjustAudio": {
+      if (o === null) break;
+      const out = o.output_path as string | undefined;
+      if (typeof out === "string") return `→ ${shortPath(out)}`;
+      break;
+    }
+    case "RenderVariant": {
+      if (o === null) break;
+      const id = o.variant_spec_id as string | undefined;
+      const dur = o.duration_ms as number | undefined;
+      const size = o.size_bytes as number | undefined;
+      const out = o.output_path as string | undefined;
+      const parts: string[] = [];
+      if (id !== undefined) parts.push(id);
+      if (dur !== undefined) parts.push(ms(dur));
+      if (size !== undefined) parts.push(bytes(size));
+      if (out !== undefined) parts.push(`→ ${shortPath(out)}`);
+      return parts.join(GREY + " · " + RESET);
+    }
+    case "ToolSearch": {
+      if (o === null) break;
+      const m = o.matches as unknown[] | undefined;
+      if (Array.isArray(m)) {
+        const names = m
+          .map((x) => (x as { name?: string }).name)
+          .filter((n): n is string => typeof n === "string")
+          .slice(0, 5)
+          .join(", ");
+        return `${m.length} match${m.length === 1 ? "" : "es"}` +
+          (names.length > 0 ? `${GREY} · ${names}${RESET}` : "");
+      }
+      break;
+    }
+    case "EnterPlanMode":
+      return `${BOLD}plan mode${RESET}`;
+    case "ExitPlanMode": {
+      if (o === null) break;
+      const ok = o.approved === true;
+      const n = o.approved_plan_count as number | undefined;
+      if (ok) return `${GREEN}approved${RESET} ${n ?? ""} plan${n === 1 ? "" : "s"}`.trim();
+      return `${YELLOW}declined${RESET}`;
+    }
+    case "DeliverToAdPlatform": {
+      if (o === null) break;
+      const platform = o.platform as string | undefined;
+      const ok = o.delivered === true;
+      return ok
+        ? `${GREEN}delivered${RESET}${platform !== undefined ? ` to ${platform}` : ""}`
+        : `${YELLOW}not delivered${RESET}`;
+    }
+  }
+  return ""; // Unknown — caller falls back to a tick.
 }
 
 function formatValue(v: unknown): string {
@@ -336,4 +516,30 @@ function formatValue(v: unknown): string {
 
 function truncate(s: string, n: number): string {
   return s.length <= n ? s : s.slice(0, n - 1) + "…";
+}
+
+function ms(milliseconds: number): string {
+  if (milliseconds < 1000) return `${milliseconds}ms`;
+  return `${(milliseconds / 1000).toFixed(1)}s`;
+}
+
+function bytes(n: number): string {
+  if (n < 1024) return `${n}B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)}MB`;
+}
+
+// Replace ~/ for home and shorten very-long paths from the middle.
+function shortPath(p: string): string {
+  let out = p;
+  const home = process.env.HOME;
+  if (home !== undefined && p.startsWith(home)) {
+    out = "~" + p.slice(home.length);
+  }
+  if (out.length > 64) {
+    const head = out.slice(0, 30);
+    const tail = out.slice(-30);
+    return `${head}…${tail}`;
+  }
+  return out;
 }

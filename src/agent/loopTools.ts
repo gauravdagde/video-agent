@@ -285,14 +285,20 @@ interface EnterPlanModeOutput {
 // loop's planApproval state is set by ExitPlanMode (the approval moment);
 // EnterPlanMode just records that the agent is reasoning about plans.
 //
+// Chat-mode behaviour: each EnterPlanMode call resets the loop's
+// planApproval state — `approved=false` and `approvedPlans` cleared. This
+// makes the gate symmetric across user messages: after rendering variant
+// A, when the user says "now do variant B", the agent calls EnterPlanMode
+// again and the user gets a fresh y/n prompt at the next ExitPlanMode.
+// Without this reset the gate would be one-shot per session.
+//
 // Useful as a discipline marker — the agent calls EnterPlanMode before
 // the analysis tools (SceneDetect / TranscriptExtract / VideoAnalyse)
 // and ExitPlanMode after submitting plans. Operators monitoring
 // recentActivities see a clear mode boundary.
-export function buildEnterPlanModeTool(): Tool<
-  z.infer<typeof EnterPlanModeInput>,
-  EnterPlanModeOutput
-> {
+export function buildEnterPlanModeTool(
+  state: PlanApprovalState,
+): Tool<z.infer<typeof EnterPlanModeInput>, EnterPlanModeOutput> {
   return {
     name: "EnterPlanMode",
     description:
@@ -308,6 +314,8 @@ export function buildEnterPlanModeTool(): Tool<
       return EnterPlanModeInput.parse(input);
     },
     async call(_input, _ctx: ToolUseContext) {
+      state.approved = false;
+      state.approvedPlans = [];
       return { ok: true as const, output: { entered: true as const } };
     },
   };

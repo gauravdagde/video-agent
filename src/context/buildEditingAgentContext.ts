@@ -5,7 +5,10 @@ import {
   loadCampaignRules,
   loadPerformanceMemory,
 } from "./loaders.ts";
-import { EDITING_AGENT_BASE_PROMPT } from "./prompts.ts";
+import {
+  CHAT_MODE_GUIDANCE,
+  EDITING_AGENT_BASE_PROMPT,
+} from "./prompts.ts";
 import { loadSessionMemory } from "../sessionMemory/sessionMemory.ts";
 import type {
   AssetId,
@@ -31,7 +34,8 @@ export type ContextBlockSource =
   | "performance_memory"
   | "session_memory"
   | "asset_metadata"
-  | "variant_specs";
+  | "variant_specs"
+  | "chat_guidance";
 
 // Pattern 1 (plan §I) — six layers, stable first, dynamic last.
 //
@@ -48,12 +52,28 @@ export type ContextBlockSource =
 // asset) but no sessionId produce byte-identical output to a build of an
 // older spawn that didn't pass sessionId at all. Adding sessionId is a
 // deliberate cache-key change.
+//
+// `chat: true` appends a stable chat-mode guidance block AFTER the base
+// identity prompt. It overrides the one-shot "render every variant /
+// final response is JSON" framing and adds REPL tone rules. The block is
+// stable so the cached prefix still extends through it.
+export interface BuildEditingAgentContextOpts {
+  readonly sessionId?: string;
+  readonly chat?: boolean;
+}
+
 export async function buildEditingAgentContext(
   brandId: BrandId,
   campaignId: CampaignId,
   assetId: AssetId,
-  sessionId?: string,
+  optsOrSessionId?: BuildEditingAgentContextOpts | string,
 ): Promise<readonly ContextBlock[]> {
+  // Backwards-compatible: existing callers pass a sessionId string.
+  const opts: BuildEditingAgentContextOpts =
+    typeof optsOrSessionId === "string"
+      ? { sessionId: optsOrSessionId }
+      : (optsOrSessionId ?? {});
+  const sessionId = opts.sessionId;
   const [guidelines, campaignRules, performance, sessionMem, asset, specs] =
     await Promise.all([
       loadBrandGuidelines(brandId),
@@ -72,10 +92,19 @@ export async function buildEditingAgentContext(
       source: "agent_identity",
       content: EDITING_AGENT_BASE_PROMPT,
     },
+  ];
+  if (opts.chat === true) {
+    blocks.push({
+      kind: "stable",
+      source: "chat_guidance",
+      content: CHAT_MODE_GUIDANCE,
+    });
+  }
+  blocks.push(
     { kind: "stable", source: "brand_guidelines", content: guidelines },
     { kind: "stable", source: "campaign_rules", content: campaignRules },
     { kind: "stable", source: "performance_memory", content: performance },
-  ];
+  );
   if (sessionMem !== null) {
     blocks.push({
       kind: "stable",
