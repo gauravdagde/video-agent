@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline/promises";
+import type { ApproverBridge } from "./approver.ts";
 import type { Conversation, TurnResult } from "./Conversation.ts";
 import type { CliRenderer } from "../ui/cli.ts";
 import { renderMarkdown } from "../ui/markdown.ts";
@@ -36,6 +37,10 @@ export interface ReplOpts {
   readonly brandId: string;
   readonly campaignId: string;
   readonly assetId?: string;
+  // Optional bridge — if provided, runRepl assigns its readline.Interface
+  // to bridge.rl. The chat plan approver can then reuse the same rl for
+  // its y/N question instead of creating a competing one.
+  readonly approverBridge?: ApproverBridge;
 }
 
 export async function runRepl(opts: ReplOpts): Promise<void> {
@@ -45,6 +50,12 @@ export async function runRepl(opts: ReplOpts): Promise<void> {
   printBanner(out, opts);
 
   const rl = readline.createInterface({ input: stdin, output: out });
+  // Hand the rl to the approver bridge so the y/N prompt during plan
+  // approval reuses our single readline instead of creating a competing
+  // one (which causes rl.question to resolve instantly with empty input).
+  if (opts.approverBridge !== undefined) {
+    opts.approverBridge.rl = rl;
+  }
 
   // Track whether a turn is currently in flight + the time of the last
   // SIGINT so a double-press can hard-exit out of a hanging turn.
@@ -94,7 +105,10 @@ export async function runRepl(opts: ReplOpts): Promise<void> {
       const expanded = expandAtPaths(trimmed, out);
 
       turnInFlight = true;
-      rl.pause();
+      // Don't rl.pause() here — the chat plan approver borrows this same
+      // rl via approverBridge for its y/N question, and pausing would
+      // block the approver too. Spinner-stomp protection comes from
+      // detachSpinner/attachSpinner instead (see CliRenderer).
       let result: TurnResult;
       try {
         result = await opts.conversation.sendUserMessage(expanded);
@@ -103,7 +117,6 @@ export async function runRepl(opts: ReplOpts): Promise<void> {
           `\n${ANSI.red}Error:${ANSI.reset} ${(e as Error).message}\n`,
         );
         turnInFlight = false;
-        rl.resume();
         continue;
       }
       turnInFlight = false;
@@ -127,10 +140,12 @@ export async function runRepl(opts: ReplOpts): Promise<void> {
       printMessageFooter(out, result);
 
       out.write("\n");
-      rl.resume();
     }
   } finally {
     process.off("SIGINT", sigintHandler);
+    if (opts.approverBridge !== undefined) {
+      opts.approverBridge.rl = null;
+    }
     rl.close();
   }
 }

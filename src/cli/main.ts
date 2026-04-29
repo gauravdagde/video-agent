@@ -18,7 +18,10 @@
 
 import { existsSync } from "node:fs";
 import { Conversation } from "../chat/Conversation.ts";
-import { createChatPlanApprover } from "../chat/approver.ts";
+import {
+  createApproverBridge,
+  createChatPlanApprover,
+} from "../chat/approver.ts";
 import { runRepl } from "../chat/repl.ts";
 import { editingAgentCompactStrategy } from "../compact/CompactStrategy.ts";
 import { buildEditingAgentContext } from "../context/buildEditingAgentContext.ts";
@@ -738,7 +741,11 @@ async function chat(args: readonly string[]): Promise<void> {
   }
 
   const ui = createCliRenderer({ quietPreview: true });
-  const approver = createChatPlanApprover({ ui });
+  // Bridge holds the REPL's readline so the approver can reuse it for
+  // its y/N question. Without this, two competing readline interfaces
+  // race for stdin and the approver's question resolves instantly.
+  const approverBridge = createApproverBridge();
+  const approver = createChatPlanApprover({ ui, bridge: approverBridge });
   const conversation = await Conversation.create({
     brandId: BRAND,
     campaignId: CAMPAIGN,
@@ -754,6 +761,7 @@ async function chat(args: readonly string[]): Promise<void> {
     campaignId: CAMPAIGN,
     assetId: ASSET,
     backendLabel: process.env.MODEL ?? "claude-opus-4-7",
+    approverBridge,
   });
 }
 

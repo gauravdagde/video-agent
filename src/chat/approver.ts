@@ -3,14 +3,15 @@ import type { EditPlanSubmission, PlanApprover } from "../agent/loopTools.ts";
 import type { CliRenderer } from "../ui/cli.ts";
 
 // User-facing PlanApprover for chat mode. Renders a plan summary, asks
-// y/n at the prompt, returns approval. Pauses the CliRenderer spinner
-// around the prompt so the live "thinking" line doesn't trample the
-// question.
+// y/N at the prompt, returns approval.
 //
-// We open a transient readline interface for the question rather than
-// reusing the REPL's main one — readline.question consumes one line then
-// relinquishes stdin cleanly, and isolating the I/O here means the
-// approver doesn't need to know anything about the REPL's lifecycle.
+// Single-readline rule: there can only be ONE readline.Interface bound
+// to stdin at a time, otherwise rl.question races with the REPL's main
+// readline and resolves immediately with empty input. The fix is the
+// `bridge` pattern — the REPL passes its own rl into this approver via
+// a shared mutable holder, and we call rl.question on it directly.
+// When no bridge rl is available (tests, or unusual host environments),
+// fall back to creating a fresh readline interface for the prompt.
 
 const ANSI = {
   bold: "\x1b[1m",
@@ -19,10 +20,24 @@ const ANSI = {
   reset: "\x1b[0m",
 } as const;
 
+// A mutable holder that lets repl.ts share its readline with the
+// approver. The approver is created in main.ts BEFORE repl.ts owns
+// stdin, so we can't pass the rl directly into the approver's
+// constructor. Instead we hand both sides the same bridge object and
+// repl.ts populates `rl` once it has it.
+export interface ApproverBridge {
+  rl: readline.Interface | null;
+}
+
+export function createApproverBridge(): ApproverBridge {
+  return { rl: null };
+}
+
 export interface ChatApproverOpts {
   readonly ui?: CliRenderer;
   readonly stream?: NodeJS.WriteStream;
   readonly stdin?: NodeJS.ReadableStream;
+  readonly bridge?: ApproverBridge;
 }
 
 export function createChatPlanApprover(
@@ -42,15 +57,25 @@ export function createChatPlanApprover(
       out.write(renderSummary(plans, rationale));
       out.write("\n");
 
-      const rl = readline.createInterface({ input: stdin, output: out });
+      const sharedRl = opts.bridge?.rl ?? null;
       let answer: string;
-      try {
-        answer = await rl.question(
+      if (sharedRl !== null) {
+        // Reuse the REPL's readline. No close — the REPL owns its
+        // lifecycle, we're just borrowing it for one question.
+        answer = await sharedRl.question(
           `${ANSI.bold}Approve and render?${ANSI.reset} [y/N] `,
         );
-      } finally {
-        rl.close();
+      } else {
+        const rl = readline.createInterface({ input: stdin, output: out });
+        try {
+          answer = await rl.question(
+            `${ANSI.bold}Approve and render?${ANSI.reset} [y/N] `,
+          );
+        } finally {
+          rl.close();
+        }
       }
+
       const a = answer.trim().toLowerCase();
       if (a === "y" || a === "yes") {
         return { approved: true };

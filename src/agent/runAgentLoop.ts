@@ -287,6 +287,13 @@ export async function runOneTurnCycle(
     response.stop_reason === "end_turn" ||
     response.stop_reason === "stop_sequence"
   ) {
+    // Push the assistant's final reply into history. Critical for chat
+    // mode: without this, the next user message sees a state.messages
+    // that's missing the agent's previous end_turn reply, and the model
+    // hallucinates "I haven't said that yet" because from its view it
+    // hasn't. In one-shot mode this is harmless — runAgentLoop returns
+    // immediately and the messages array is discarded.
+    state.messages.push({ role: "assistant", content: response.content });
     return { done: true, finalText: extractText(response.content) };
   }
 
